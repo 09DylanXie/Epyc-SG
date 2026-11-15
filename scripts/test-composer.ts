@@ -49,14 +49,15 @@ for (const st of STYLE_LIST) {
       const n = trial === 0 ? 1 : trial === 1 ? 2 : trial === 2 ? 16 : rng.int(3, 12);
       const notes = trial % 3 === 0 ? Array.from({ length: n }, () => rng.int(48, 84)) : inspire(rng.int(1, 1e9), rng.int(0, 11), st.modes[rng.int(0, st.modes.length - 1)][0]).slice(0, Math.max(1, n));
       const intensity = [0.2, 0.8, 1][trial % 3];
+      const drop = trial % 2 === 1;
       let sc;
       try {
-        sc = compose({ notes, styleId: st.id, seed: rng.int(1, 1e9), length: len, intensity });
+        sc = compose({ notes, styleId: st.id, seed: rng.int(1, 1e9), length: len, intensity, drop });
       } catch (e) {
         fail(`${st.id}/${len}: compose threw ${(e as Error).stack}`);
         continue;
       }
-      const again = compose({ notes, styleId: st.id, seed: sc.seed, length: len, intensity });
+      const again = compose({ notes, styleId: st.id, seed: sc.seed, length: len, intensity, drop });
       if (JSON.stringify(again.events) !== JSON.stringify(sc.events)) fail(`${st.id}/${len}: not deterministic`);
       let prev = -1;
       for (const e of sc.events) {
@@ -91,6 +92,30 @@ for (const st of STYLE_LIST) {
   }
 }
 console.log(rows.join('\n'));
+
+// 2b. build-up & drop: every climax is preceded by a build, a riser and a silent beat, and lands with an impact and a sub drop
+for (const st of STYLE_LIST) {
+  for (const len of LENGTHS) {
+    const sc = compose({ notes: [62, 65, 69, 67, 64], styleId: st.id, seed: 99, length: len, intensity: 0.8, drop: true });
+    const plain = compose({ notes: [62, 65, 69, 67, 64], styleId: st.id, seed: 99, length: len, intensity: 0.8 });
+    const id = `${st.id}/${len}`;
+    if (sc.totalBars < plain.totalBars) fail(`${id}: drop made the piece shorter`);
+    let targets = sc.sections.filter((x) => x.kind === 'climax' || (x.kind === 'finale' && x.energy >= 0.9));
+    if (!targets.length) targets = sc.sections.filter((x, i) => i > 0 && sc.sections[i - 1].kind === 'build' && sc.sections[i - 1].say.some((w) => w.includes('build-up')));
+    if (!targets.length) fail(`${id}: no climax to drop into`);
+    for (const t of targets) {
+      const T = t.startBeat;
+      const at = (i: string) => sc.events.some((e) => e.i === i && Math.abs(e.t - T) < 0.05);
+      if (!at('impact') || !at('subDrop')) fail(`${id}: ${t.name} has no impact/subDrop`);
+      if (!sc.events.some((e) => e.i === 'riser' && e.t < T && e.t + e.d > T - 0.1)) fail(`${id}: no riser into ${t.name}`);
+      const noisy = sc.events.filter((e) => e.b !== 'fx' && e.t > T - 0.9 && e.t < T - 0.06);
+      if (noisy.length) fail(`${id}: ${noisy.length} notes in the silent beat before ${t.name} (${noisy[0].i})`);
+      const prev = sc.sections[sc.sections.indexOf(t) - 1];
+      if (!prev || prev.kind !== 'build') fail(`${id}: ${t.name} not preceded by a build`);
+    }
+  }
+}
+console.log('drop checks done');
 
 // 3. one readable sample
 const sample = compose({ notes: [62, 65, 69, 67, 64], styleId: 'titan', seed: 7, length: 'standard', intensity: 0.8 });

@@ -5,7 +5,7 @@ import { player } from '@/engine/audio/player';
 import { STYLES } from '@/engine/styles';
 import { MODES, PC_NAMES, pcOf, type ModeId } from '@/engine/theory';
 import { INST_LABEL, type PieceLength } from '@/engine/types';
-import { Close, Lock, Play, Spark, Undo } from './icons';
+import { Close, Listen, Lock, Play, Spark, Undo } from './icons';
 import { COLS, PAD_CAPS, PIANO_CAPS, PIANO_HI, PIANO_LO, ROWS, inScale, padMidi } from './keys';
 import { onFrame } from './loop';
 import Midi from './Midi';
@@ -72,7 +72,11 @@ function Tray() {
   const capture = useStudio((s) => s.capture);
   const phase = useStudio((s) => s.phase);
   const hasScore = useStudio((s) => !!s.score);
-  const { undo, newMotif, setCapture, previewMotif, forge, inspireMe } = useStudio.getState();
+  const importing = useStudio((s) => s.importing);
+  const heard = useStudio((s) => s.heard);
+  const origin = useStudio((s) => s.origin);
+  const { undo, newMotif, setCapture, previewMotif, forge, inspireMe, importFile, nextPhrase } = useStudio.getState();
+  const fileRef = useRef<HTMLInputElement>(null);
   const lo = motif.length ? Math.min(...motif) : 0;
   const hi = motif.length ? Math.max(...motif) : 1;
   const compact = motif.length > 10;
@@ -102,9 +106,22 @@ function Tray() {
             {!compact && <span className="opacity-50">{octaveOf(m)}</span>}
           </span>
         ))}
-        {!motif.length && (
+        {!motif.length && !importing && (
           <span className="truncate px-2 text-[12.5px] font-medium text-faint">
-            Your motif appears here — play 3 to 8 notes, or let <b className="text-dim">Inspire</b> start one for you.
+            Your motif appears here — play 3 to 8 notes, let <b className="text-dim">Inspire</b> start one, or <b className="text-dim">Import</b> a song and I&apos;ll take its melody.
+          </span>
+        )}
+        {importing && (
+          <span className="flex min-w-0 flex-1 items-center gap-2.5 px-2 text-[12px] font-medium text-dim" data-testid="importing">
+            <span className="truncate">{importing.label}…</span>
+            <span className="h-1 w-24 flex-none overflow-hidden rounded-full bg-white/10">
+              <span className="block h-full rounded-full" style={{ width: `${Math.round(importing.p * 100)}%`, background: 'var(--a1)' }} />
+            </span>
+          </span>
+        )}
+        {origin && heard && motif.length > 0 && (
+          <span className="hidden truncate pl-2 text-[11px] font-medium text-faint xl:inline" title={`Heard in ${origin.name}`}>
+            from {origin.name}
           </span>
         )}
         {capture && motif.length > 0 && motif.length < MAX_NOTES && <span className="ghost-slot" style={{ flex: '0 1 34px', minWidth: 0 }} />}
@@ -124,11 +141,41 @@ function Tray() {
         )}
       </div>
 
-      <button className="btn h-12 px-3.5" onClick={inspireMe} disabled={busy} title="Write a motif for me">
+      <input
+        ref={fileRef}
+        type="file"
+        accept="audio/*,.mp3,.wav,.m4a,.ogg,.flac"
+        className="hidden"
+        data-testid="import-file"
+        onChange={(e) => {
+          const file = e.target.files?.[0];
+          e.target.value = '';
+          if (file) void importFile(file);
+        }}
+      />
+      {heard && origin && heard.phrases.length > 1 ? (
+        <button className="btn h-12 flex-col !gap-0.5 px-3" onClick={nextPhrase} disabled={busy || !!importing} data-testid="next-phrase" title={`Use another melody heard in ${heard.name}`}>
+          <span className="text-[11.5px]">Another phrase</span>
+          <span className="font-mono text-[9.5px] font-medium text-faint">
+            {heard.idx + 1}/{heard.phrases.length}
+          </span>
+        </button>
+      ) : null}
+      <button
+        className="btn h-12 px-3.5"
+        onClick={() => fileRef.current?.click()}
+        disabled={busy || !!importing}
+        data-testid="import"
+        title="Import an MP3 (or WAV, M4A, OGG): I take its melody and write a new piece around it in this mode. The file stays on your device. Use recordings whose melody you have the rights to."
+      >
+        <Listen size={16} style={{ color: 'var(--a1)' }} />
+        Import
+      </button>
+      <button className="btn h-12 px-3.5" onClick={inspireMe} disabled={busy || !!importing} title="Write a motif for me">
         <Spark size={15} style={{ color: 'var(--a1)' }} />
         Inspire
       </button>
-      <button className={`forge ${motif.length && !busy ? 'ready' : ''}`} onClick={() => void forge()} disabled={busy} data-testid="forge" title="Compose the piece (Enter)">
+      <button className={`forge ${motif.length && !busy ? 'ready' : ''}`} onClick={() => void forge()} disabled={busy || !!importing} data-testid="forge" title="Compose the piece (Enter)">
         {busy ? 'FORGING' : hasScore ? 'REFORGE' : 'FORGE'}
       </button>
     </div>
@@ -148,8 +195,12 @@ function Controls() {
   const octave = useStudio((s) => s.octave);
   const length = useStudio((s) => s.length);
   const intensity = useStudio((s) => s.intensity);
-  const voice = useStudio((s) => INST_LABEL[STYLES[s.styleId].padVoice]);
-  const { setPadKey, setKeyLocked, setKbTarget, setLength, setIntensity } = useStudio.getState();
+  const drop = useStudio((s) => s.drop);
+  const voice = useStudio((s) => {
+    const st = STYLES[s.styleId];
+    return st.padLow ? `${INST_LABEL[st.padVoice]} · low notes ${INST_LABEL[st.padLow.inst]}` : INST_LABEL[st.padVoice];
+  });
+  const { setPadKey, setKeyLocked, setKbTarget, setLength, setIntensity, setDrop } = useStudio.getState();
 
   return (
     <div className="flex flex-wrap items-center gap-x-2.5 gap-y-2">
@@ -198,6 +249,15 @@ function Controls() {
           </button>
         ))}
       </div>
+      <button
+        className={`btn ${drop ? 'on' : ''}`}
+        onClick={() => setDrop(!drop)}
+        aria-pressed={drop}
+        data-drop
+        title={drop ? 'Build-up & drop on: every big moment gets a run-up, a beat of silence and a drop' : 'Add a build-up and a drop before the big moments of your piece'}
+      >
+        Build &amp; Drop
+      </button>
       <label className="flex items-center gap-2 text-[10.5px] font-bold uppercase tracking-[0.12em] text-faint" title="How hard the orchestra hits">
         Intensity
         <input

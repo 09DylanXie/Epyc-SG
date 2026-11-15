@@ -23,6 +23,12 @@ page.on('console', (m) => {
   if (m.type() === 'error' || m.type() === 'warning') errors.push(`[${m.type()}] ${m.text()}`);
 });
 page.on('pageerror', (e) => errors.push('pageerror: ' + (e.stack || e.message)));
+// every recorded-instrument file the page fetches, by status
+const sampleHits = {};
+page.on('response', (r) => {
+  if (r.url().includes('/samples/')) sampleHits[r.status()] = (sampleHits[r.status()] || 0) + 1;
+});
+const standIns = () => page.evaluate(() => ({ ...window.__epyc.standIns }));
 const check = (ok, what) => {
   console.log(ok ? '  ok  ' : '  FAIL', what);
   if (!ok) fails.push(what);
@@ -81,6 +87,13 @@ await page.keyboard.press('Backspace');
 check((await state()).motif === 5, 'Backspace removes the last note');
 
 console.log('forge');
+{
+  const si = await standIns();
+  const voice = await page.evaluate(() => window.__epyc.store.getState().styleId);
+  check(si.n === 0, `live pad notes in ${voice} played recordings (${si.n} stand-ins${si.last ? ', last ' + si.last : ''})`);
+}
+// from here on, every note that should be a recording must be one
+await page.evaluate(() => { window.__epyc.standIns.n = 0; window.__epyc.standIns.last = ''; });
 let t = Date.now();
 await page.keyboard.press('Enter');
 await ready(undefined);
@@ -153,13 +166,53 @@ for (const w of worlds) {
   await download('dl-mp3', `${w}-mp3`);
 }
 
+const dropWorld = arg('drop', 'titan');
+let extra = 0;
+if (dropWorld !== 'none') {
+  console.log('build & drop →', dropWorld);
+  const before = (await state()).title;
+  if ((await state()).style !== dropWorld) {
+    await page.click(`[data-world="${dropWorld}"]`);
+    await ready(before);
+    extra++;
+  }
+  const plainSecs = await page.evaluate(() => window.__epyc.store.getState().score.sections.length);
+  // with a piece already loaded, the toggle alone must rewrite it
+  await page.click('[data-drop]');
+  check(await page.evaluate(() => window.__epyc.store.getState().drop), 'Build & Drop switches on');
+  await page.waitForFunction(() => {
+    const s = window.__epyc.store.getState();
+    return s.phase === 'ready' && s.score && s.score.insights.some((i) => i.title === 'Build-up & drop');
+  }, null, { timeout: 60000 });
+  extra++;
+  check((await state()).playing, 'the rewritten piece plays');
+  const d = await page.evaluate(() => {
+    const sc = window.__epyc.store.getState().score;
+    return { secs: sc.sections.map((x) => `${x.name}[${x.kind}]`), insight: sc.insights.some((i) => i.title === 'Build-up & drop'), subs: sc.events.filter((e) => e.i === 'subDrop').length };
+  });
+  console.log('  ', d.secs.join(' > '));
+  check(d.secs.length >= plainSecs, `same notes, same seed, now ${d.secs.length} parts (was ${plainSecs})`);
+  check(d.insight && d.subs > 0, `the piece has a build-up and drop (${d.subs} sub drops)`);
+  const prefs = await page.evaluate(() => JSON.parse(localStorage.getItem('epyc-sg.prefs.v1') || '{}').drop);
+  check(prefs === true, 'the choice is remembered');
+  await page.waitForTimeout(3000);
+  await page.screenshot({ path: `${out}/07-drop.png` });
+  await download('dl-mp3', `${dropWorld}-drop-mp3`);
+}
+
 console.log('library');
 await page.getByRole('button', { name: /^Library/ }).click();
 await page.waitForTimeout(400);
 await page.screenshot({ path: `${out}/06-library.png` });
 s = await state();
-check(s.library === 1 + worlds.length, `library holds every piece forged (${s.library})`);
+check(s.library === 1 + worlds.length + extra, `library holds every piece forged (${s.library})`);
 
+{
+  const si = await standIns();
+  console.log('  samples fetched by status:', JSON.stringify(sampleHits));
+  check(si.n === 0, `every string, brass and flute note played its recording (${si.n} synth stand-ins${si.last ? ', last ' + si.last : ''})`);
+  check(!Object.keys(sampleHits).some((k) => +k >= 400), 'no sample request failed');
+}
 if (errors.length) console.log('console:', errors.slice(0, 20));
 check(errors.length === 0, 'console is clean');
 await browser.close();

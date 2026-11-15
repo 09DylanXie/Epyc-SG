@@ -47,6 +47,13 @@ export const Download = ({ size, ...p }: P) => (
     <path d="M4.5 20h15" />
   </svg>
 );
+/** a waveform with an arrow into it: bring a recording in */
+export const Listen = ({ size, ...p }: P) => (
+  <svg {...base(size, p)}>
+    <path d="M3 12h1.5M6.5 8v8M10 5v14M13.5 9v6M17 11v2" />
+    <path d="M19 4.5v7M16.5 9l2.5 2.5L21.5 9" />
+  </svg>
+);
 export const Spark = ({ size, ...p }: P) => (
   <svg {...base(size, p)} fill="currentColor" stroke="none">
     <path d="M12 2.5l1.9 5.6a3 3 0 0 0 1.9 1.9l5.7 2-5.7 1.9a3 3 0 0 0-1.9 1.9L12 21.5l-1.9-5.7a3 3 0 0 0-1.9-1.9l-5.7-1.9 5.7-2a3 3 0 0 0 1.9-1.9L12 2.5z" />

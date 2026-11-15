@@ -1,6 +1,7 @@
 'use client';
 
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
+import { STAND_INS } from '@/engine/audio/graph';
 import { exportTiming, player } from '@/engine/audio/player';
 import { STYLES } from '@/engine/styles';
 import Deck from './Deck';
@@ -103,6 +104,50 @@ function useKeyboard() {
   }, []);
 }
 
+/** drop a song anywhere on the studio to take its melody */
+function useFileDrop() {
+  const [over, setOver] = useState(false);
+  useEffect(() => {
+    let depth = 0;
+    const hasFile = (e: DragEvent) => !!e.dataTransfer && [...e.dataTransfer.types].includes('Files');
+    const enter = (e: DragEvent) => {
+      if (!hasFile(e)) return;
+      depth++;
+      setOver(true);
+    };
+    const leave = (e: DragEvent) => {
+      if (!hasFile(e)) return;
+      depth = Math.max(0, depth - 1);
+      if (!depth) setOver(false);
+    };
+    const overFn = (e: DragEvent) => {
+      if (!hasFile(e)) return;
+      e.preventDefault();
+      e.dataTransfer!.dropEffect = 'copy';
+    };
+    const drop = (e: DragEvent) => {
+      if (!hasFile(e)) return;
+      e.preventDefault();
+      depth = 0;
+      setOver(false);
+      const file = [...(e.dataTransfer?.files ?? [])].find((x) => x.type.startsWith('audio/') || /\.(mp3|wav|m4a|ogg|flac|aac)$/i.test(x.name));
+      if (file) void useStudio.getState().importFile(file);
+      else useStudio.getState().say('Drop an audio file (MP3, WAV, M4A or OGG) and I will take its melody.');
+    };
+    window.addEventListener('dragenter', enter);
+    window.addEventListener('dragleave', leave);
+    window.addEventListener('dragover', overFn);
+    window.addEventListener('drop', drop);
+    return () => {
+      window.removeEventListener('dragenter', enter);
+      window.removeEventListener('dragleave', leave);
+      window.removeEventListener('dragover', overFn);
+      window.removeEventListener('drop', drop);
+    };
+  }, []);
+  return over;
+}
+
 function Toast() {
   const toast = useStudio((s) => s.toast);
   if (!toast) return null;
@@ -121,7 +166,7 @@ export default function Studio() {
   useEffect(() => {
     useStudio.getState().init();
     // handy in the console: __epyc.player, __epyc.store.getState()
-    (window as unknown as { __epyc: unknown }).__epyc = { player, store: useStudio, fx, pace, forgeTiming, exportTiming };
+    (window as unknown as { __epyc: unknown }).__epyc = { player, store: useStudio, fx, pace, forgeTiming, exportTiming, standIns: STAND_INS };
   }, []);
   useEffect(() => {
     const root = document.documentElement.style;
@@ -130,6 +175,7 @@ export default function Studio() {
     root.setProperty('--a3', style.palette[2]);
   }, [style]);
   useKeyboard();
+  const dropping = useFileDrop();
 
   return (
     <>
@@ -145,6 +191,14 @@ export default function Studio() {
       </div>
       <ExportDialog />
       <Toast />
+      {dropping && (
+        <div className="drop-veil" aria-hidden>
+          <div>
+            <b>Drop a song</b>
+            <span>I&apos;ll take its melody and write a {style.name} piece around it</span>
+          </div>
+        </div>
+      )}
     </>
   );
 }

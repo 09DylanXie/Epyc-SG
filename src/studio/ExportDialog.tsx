@@ -10,6 +10,7 @@ const mb = (bytes: number) => (bytes / 1048576).toFixed(1) + ' MB';
 /** renders the piece offline, faster than real time, and hands it over as a file */
 export default function ExportDialog() {
   const exp = useStudio((s) => s.exp);
+  const origin = useStudio((s) => s.score?.origin ?? null);
   const score = useStudio((s) => s.score);
   const style = useStudio((s) => STYLES[s.styleId]);
   const { openExport, download } = useStudio.getState();
@@ -79,8 +80,20 @@ export default function ExportDialog() {
         </div>
 
         <div className="mt-5 border-t border-white/[0.08] pt-4 text-[11.5px] leading-relaxed text-dim">
-          <b className="text-ink">Yours to use.</b> Every sound here is synthesized from scratch in your browser — no samples, no loops, no third-party recordings — and the composition is generated from the notes
-          you played. Use it in your games, films, streams and commercial projects.
+          {origin ? (
+            <>
+              <b className="text-ink">Check the melody first.</b> The tune of this piece was taken from <b className="text-dim">{origin.name}</b>. If you don&apos;t own that melody, make sure you have the rights to use it before releasing this. Everything around it was written new.{' '}
+            </>
+          ) : (
+            <>
+              <b className="text-ink">Yours to use.</b> The composition is generated from the notes you played.{' '}
+            </>
+          )}
+          The strings, brass and flute are real recordings from{' '}
+          <a className="underline decoration-white/30 underline-offset-2 hover:text-ink" href="/samples/CREDITS.txt" target="_blank" rel="noreferrer">
+            VSCO 2 Community Edition
+          </a>
+          , released into the public domain (CC0); everything else is synthesized in your browser. No loops, no licensed tracks.{origin ? '' : ' Use it in your games, films, streams and commercial projects.'}
         </div>
       </div>
     </div>

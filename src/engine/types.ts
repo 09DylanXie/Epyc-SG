@@ -5,7 +5,7 @@ import type { Chord, ChordExt, ModeId, PoolId, ProgPool } from './theory';
 export const INSTRUMENTS = [
   // orchestra
   'strings', 'tremolo', 'spiccato', 'pizz', 'cello', 'violin', 'horns', 'trumpets', 'lowBrass',
-  'choirAh', 'choirOo', 'choirStac', 'soprano', 'piano', 'felt', 'harp', 'zither', 'bell', 'glock',
+  'choirAh', 'choirOo', 'choirLo', 'choirStac', 'soprano', 'piano', 'felt', 'harp', 'zither', 'bell', 'glock',
   'celesta', 'organ', 'flute', 'bamboo', 'timpani', 'braam',
   // synths
   'sub', 'synBass', 'reese', 'b808', 'sawPad', 'warmPad', 'superSaw', 'pluck', 'arp', 'lead', 'ePiano',
@@ -34,8 +34,8 @@ export const BUS_LABEL: Record<Bus, string> = {
 
 export const INST_LABEL: Record<Inst, string> = {
   strings: 'string section', tremolo: 'tremolo strings', spiccato: 'spiccato strings', pizz: 'pizzicato',
-  cello: 'solo cello', violin: 'solo violin', horns: 'French horns', trumpets: 'trumpets', lowBrass: 'low brass',
-  choirAh: 'full choir', choirOo: 'hushed choir', choirStac: 'choir chants', soprano: 'solo soprano',
+  cello: 'cellos', violin: 'solo violin', horns: 'French horns', trumpets: 'trumpets', lowBrass: 'low brass',
+  choirAh: 'full choir', choirOo: 'hushed choir', choirLo: "men's choir", choirStac: 'choir chants', soprano: 'solo soprano',
   piano: 'grand piano', felt: 'felt piano', harp: 'harp', zither: 'zither', bell: 'cathedral bell',
   glock: 'glockenspiel', celesta: 'celesta', organ: 'pipe organ', flute: 'flute', bamboo: 'bamboo flute',
   timpani: 'timpani', braam: 'braam', sub: 'sub bass', synBass: 'synth bass', reese: 'reese bass',
@@ -170,6 +170,7 @@ export interface Score {
   /** home tonic midi the melody is written around */
   baseTonic: number;
   progression: string;
+  origin?: Origin | null;
 }
 
 // ───────────────────────────── style presets ─────────────────────────────
@@ -281,6 +282,8 @@ export interface StylePreset {
   chordExt: ChordExt;
   /** the voice the pads play live */
   padVoice: Inst;
+  /** live notes below this MIDI note play a second voice instead (e.g. the men under the sopranos) */
+  padLow?: { below: number; inst: Inst };
   reverb: { size: number; damp: number; wet: number; predelay: number };
   /** master tone tilt in dB */
   tilt: { low: number; high: number };
@@ -318,6 +321,22 @@ export interface ComposeInput {
   intensity: number;
   tempo?: number | null;
   key?: { tonicPc: number; mode: ModeId } | null;
+  /** give every big arrival a build-up, a breath of silence and a drop */
+  drop?: boolean;
+  /** the notes were heard in an imported recording */
+  origin?: Origin | null;
+}
+
+export interface Origin {
+  /** file name as the user knows it */
+  name: string;
+  /** where in the recording the phrase was heard, in seconds */
+  from: number;
+  to: number;
+  /** how many more times the phrase's shape came back in the recording */
+  repeats?: number;
+  /** the melody was hard to make out, so this is a best guess */
+  loose?: boolean;
 }
 
 export type { Chord };

@@ -12,7 +12,7 @@ const vars = (p: readonly string[]) => ({ '--w1': p[0], '--w2': p[1], '--w3': p[
 export default function Modes() {
   const styleId = useStudio((s) => s.styleId);
   const library = useStudio((s) => s.library);
-  const busy = useStudio((s) => s.phase === 'forging');
+  const busy = useStudio((s) => s.phase === 'forging' || !!s.importing);
   const setWorld = useStudio((s) => s.setWorld);
   const openPiece = useStudio((s) => s.openPiece);
   const removePiece = useStudio((s) => s.removePiece);

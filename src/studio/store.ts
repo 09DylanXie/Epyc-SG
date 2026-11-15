@@ -3,7 +3,8 @@ import { player } from '@/engine/audio/player';
 import { compose, inspire } from '@/engine/composer';
 import { STYLES } from '@/engine/styles';
 import type { ModeId } from '@/engine/theory';
-import { BUSES, type Bus, type PieceLength, type Score } from '@/engine/types';
+import { BUSES, type Bus, type Origin, type PieceLength, type Score, type StylePreset } from '@/engine/types';
+import { fitRange, type Phrase } from '@/engine/listen';
 import { allPadMidis, inScale, type PadKey } from './keys';
 
 export const MAX_NOTES = 16;
@@ -18,6 +19,8 @@ export interface SavedPiece {
   seed: number;
   length: PieceLength;
   intensity: number;
+  drop?: boolean;
+  origin?: Origin | null;
   key: PadKey;
   keyName: string;
   bpm: number;
@@ -48,6 +51,14 @@ interface Studio {
   capture: boolean;
   length: PieceLength;
   intensity: number;
+  /** add a build-up and a drop before every big arrival */
+  drop: boolean;
+  /** the motif was heard in an imported recording (cleared as soon as the motif is edited) */
+  origin: Origin | null;
+  /** the phrases heard in the last imported recording, to try another */
+  heard: { name: string; phrases: Phrase[]; idx: number } | null;
+  /** an import in progress */
+  importing: { p: number; label: string } | null;
   seed: number;
   padKey: PadKey;
   /** the user picked this key by hand, so the composer must respect it */
@@ -92,6 +103,9 @@ interface Studio {
   setKeyLocked(on: boolean): void;
   setLength(l: PieceLength): void;
   setIntensity(v: number): void;
+  setDrop(on: boolean): void;
+  importFile(file: File): Promise<void>;
+  nextPhrase(): void;
   setKbTarget(t: 'pads' | 'piano'): void;
   shiftOctave(d: number): void;
   forge(kind?: ForgeKind): Promise<void>;
@@ -114,6 +128,8 @@ interface Studio {
 export const forgeTiming = { compose: 0, load: 0, total: 0 };
 
 let rehearsed = '';
+/** the voice a live note plays in this world: some worlds split the keyboard into a low and a high voice */
+const voiceAt = (style: StylePreset, midi: number) => (style.padLow && midi < style.padLow.below ? style.padLow.inst : style.padVoice);
 const rand = () => Math.floor(Math.random() * 2 ** 31);
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const each = <T,>(v: T) => Object.fromEntries(BUSES.map((b) => [b, v])) as Record<Bus, T>;
@@ -144,18 +160,21 @@ export const useStudio = create<Studio>()((set, get) => {
     const idle = (window as unknown as { requestIdleCallback?: (f: () => void) => void }).requestIdleCallback ?? ((f: () => void) => setTimeout(f, 60));
     idle(() => {
       const style = STYLES[s.styleId];
-      player.warm(allPadMidis(s.padKey), style.padVoice);
-      if (rehearsed === style.id) return;
-      rehearsed = style.id;
+      const pads = allPadMidis(s.padKey);
+      player.warm(pads.filter((m) => voiceAt(style, m) === style.padVoice), style.padVoice);
+      if (style.padLow) player.warm(pads.filter((m) => m < style.padLow!.below), style.padLow.inst);
+      const rehearsal = `${style.id}:${s.drop}`;
+      if (rehearsed === rehearsal) return;
+      rehearsed = rehearsal;
       // a throwaway piece in this world shows which drums, bells and strings a real one will need;
       // they are synthesized in the background now, so the forge has nothing left to wait for
-      const demo = compose({ notes: inspire(7, s.padKey.tonicPc, s.padKey.mode), styleId: style.id, seed: 7, length: s.length, intensity: s.intensity, key: s.padKey });
+      const demo = compose({ notes: inspire(7, s.padKey.tonicPc, s.padKey.mode), styleId: style.id, seed: 7, length: s.length, intensity: s.intensity, drop: s.drop, key: s.padKey });
       player.prewarm(style, demo.events);
     });
   };
   const savePrefs = () => {
     const s = get();
-    writeJson(PREF_KEY, { styleId: s.styleId, length: s.length, intensity: s.intensity, volume: s.volume, kbTarget: s.kbTarget });
+    writeJson(PREF_KEY, { styleId: s.styleId, length: s.length, intensity: s.intensity, drop: s.drop, volume: s.volume, kbTarget: s.kbTarget });
   };
 
   return {
@@ -164,6 +183,10 @@ export const useStudio = create<Studio>()((set, get) => {
     capture: true,
     length: 'standard',
     intensity: 0.8,
+    drop: false,
+    origin: null,
+    heard: null,
+    importing: null,
     seed: 1,
     padKey: { tonicPc: 2, mode: 'aeolian' },
     keyLocked: false,
@@ -195,7 +218,7 @@ export const useStudio = create<Studio>()((set, get) => {
     init() {
       if (wired) return;
       wired = true;
-      const prefs = readJson<Partial<Pick<Studio, 'styleId' | 'length' | 'intensity' | 'volume' | 'kbTarget'>>>(PREF_KEY, {});
+      const prefs = readJson<Partial<Pick<Studio, 'styleId' | 'length' | 'intensity' | 'drop' | 'volume' | 'kbTarget'>>>(PREF_KEY, {});
       const styleId = prefs.styleId && STYLES[prefs.styleId] ? prefs.styleId : 'titan';
       const style = STYLES[styleId];
       const volume = typeof prefs.volume === 'number' ? Math.max(0, Math.min(1, prefs.volume)) : 0.9;
@@ -205,6 +228,7 @@ export const useStudio = create<Studio>()((set, get) => {
         styleId,
         length: prefs.length === 'short' || prefs.length === 'extended' ? prefs.length : 'standard',
         intensity: typeof prefs.intensity === 'number' ? Math.max(0, Math.min(1, prefs.intensity)) : 0.8,
+        drop: prefs.drop === true,
         volume,
         kbTarget: prefs.kbTarget === 'piano' ? 'piano' : 'pads',
         padKey: { tonicPc: 2, mode: style.modes[0][0] },
@@ -221,7 +245,7 @@ export const useStudio = create<Studio>()((set, get) => {
     setWorld(id) {
       const s = get();
       const style = STYLES[id];
-      if (!style || id === s.styleId || s.phase === 'forging') return;
+      if (!style || id === s.styleId || s.phase === 'forging' || s.importing) return;
       get().releaseAll();
       if (s.score) {
         // same motif, new world: let it be re-read in that world's own language
@@ -239,10 +263,13 @@ export const useStudio = create<Studio>()((set, get) => {
     press(midi, vel = 0.88) {
       const s = get();
       if (s.held[midi]) return;
-      player.noteOn('k' + midi, midi, vel, STYLES[s.styleId].padVoice);
+      player.noteOn('k' + midi, midi, vel, voiceAt(STYLES[s.styleId], midi));
       const next: Partial<Studio> = { held: { ...s.held, [midi]: true } };
       if (s.capture && s.phase !== 'forging') {
-        if (s.motif.length < MAX_NOTES) next.motif = [...s.motif, midi];
+        if (s.motif.length < MAX_NOTES) {
+          next.motif = [...s.motif, midi];
+          next.origin = null;
+        }
         else get().say(`A motif holds ${MAX_NOTES} notes — forge it, or start a new one.`);
       }
       set(next);
@@ -265,12 +292,12 @@ export const useStudio = create<Studio>()((set, get) => {
     undo() {
       const s = get();
       if (!s.capture || !s.motif.length) return;
-      set({ motif: s.motif.slice(0, -1) });
+      set({ motif: s.motif.slice(0, -1), origin: null });
     },
 
     newMotif() {
       previewRun++;
-      set({ motif: [], capture: true });
+      set({ motif: [], capture: true, origin: null });
     },
 
     setCapture(on) {
@@ -280,7 +307,7 @@ export const useStudio = create<Studio>()((set, get) => {
     inspireMe() {
       const s = get();
       if (s.phase === 'forging') return;
-      set({ motif: inspire(rand(), s.padKey.tonicPc, s.padKey.mode), capture: true });
+      set({ motif: inspire(rand(), s.padKey.tonicPc, s.padKey.mode), capture: true, origin: null });
       get().previewMotif();
     },
 
@@ -289,14 +316,14 @@ export const useStudio = create<Studio>()((set, get) => {
       const notes = s.motif;
       if (!notes.length) return;
       const run = ++previewRun;
-      const inst = STYLES[s.styleId].padVoice;
+      const style = STYLES[s.styleId];
       const step = s.playing ? 0 : 230;
       if (!step) return;
       void (async () => {
         for (let i = 0; i < notes.length; i++) {
           if (run !== previewRun) return;
           const id = `pv${run}-${i}`;
-          player.noteOn(id, notes[i], 0.8, inst);
+          player.noteOn(id, notes[i], 0.8, voiceAt(style, notes[i]));
           set({ held: { ...get().held, [notes[i]]: true } });
           await sleep(step);
           player.noteOff(id);
@@ -328,6 +355,16 @@ export const useStudio = create<Studio>()((set, get) => {
       savePrefs();
     },
 
+    setDrop(on) {
+      const s = get();
+      if (s.phase === 'forging' || on === s.drop) return;
+      set({ drop: on });
+      savePrefs();
+      // a piece is already playing: rewrite it with the same notes and seed, now with (or without) its drops
+      if (s.score) void get().forge('restore');
+      else warm();
+    },
+
     setKbTarget(t) {
       get().releaseAll();
       set({ kbTarget: t });
@@ -341,7 +378,7 @@ export const useStudio = create<Studio>()((set, get) => {
 
     async forge(kind = 'new') {
       const s = get();
-      if (s.phase === 'forging') return;
+      if (s.phase === 'forging' || s.importing) return;
       previewRun++;
       const style = STYLES[s.styleId];
       const before = s.phase;
@@ -349,12 +386,13 @@ export const useStudio = create<Studio>()((set, get) => {
         player.ensure();
         get().releaseAll();
         let notes = s.motif;
+        const origin = notes.length ? s.origin : null;
         if (!notes.length) notes = inspire(rand(), s.padKey.tonicPc, s.padKey.mode);
         const seed = kind === 'restore' ? s.seed : rand();
         const fits = notes.every((n) => inScale(n, s.padKey));
         const key = kind === 'restore' ? s.padKey : kind === 'new' && s.keyLocked && fits ? s.padKey : null;
         const t0 = performance.now();
-        const score = compose({ notes, styleId: style.id, seed, length: s.length, intensity: s.intensity, key });
+        const score = compose({ notes, styleId: style.id, seed, length: s.length, intensity: s.intensity, drop: s.drop, key, origin });
         const t1 = performance.now();
         forgeTiming.compose = t1 - t0;
         const count = score.events.length.toLocaleString('en-US');
@@ -380,13 +418,15 @@ export const useStudio = create<Studio>()((set, get) => {
         await loading;
         const padKey: PadKey = { tonicPc: score.tonicPc, mode: score.mode as ModeId };
         const piece: SavedPiece = {
-          id: `${style.id}:${seed}:${notes.join('.')}:${s.length}:${Math.round(s.intensity * 100)}`,
+          id: `${style.id}:${seed}:${notes.join('.')}:${s.length}:${Math.round(s.intensity * 100)}${s.drop ? ':drop' : ''}`,
           title: score.title,
           styleId: style.id,
           notes,
           seed,
           length: s.length,
           intensity: s.intensity,
+          drop: s.drop,
+          origin,
           key: padKey,
           keyName: score.keyName,
           bpm: score.bpm,
@@ -404,6 +444,42 @@ export const useStudio = create<Studio>()((set, get) => {
         set({ phase: before, pending: null });
         get().say('The forge stumbled — ' + (err instanceof Error ? err.message : 'please try again.'));
       }
+    },
+
+    async importFile(file) {
+      const s = get();
+      if (s.phase === 'forging' || s.importing) return;
+      previewRun++;
+      get().releaseAll();
+      set({ importing: { p: 0, label: 'Reading the file' } });
+      try {
+        player.ensure();
+        const { hearFile } = await import('@/engine/audio/hear');
+        const heard = await hearFile(file, (p, label) => set({ importing: { p, label } }));
+        set({ importing: null });
+        if (!heard.phrases.length) {
+          get().say(`I couldn't hear a clear melody in ${file.name}. A song with a clear lead or vocal line works best.`);
+          return;
+        }
+        const name = file.name.replace(/\.[a-z0-9]+$/i, '');
+        set({ heard: { name, phrases: heard.phrases, idx: -1 } });
+        get().nextPhrase();
+        if (heard.phrases[0].loose) get().say(`The melody in ${file.name} was hard to hear clearly, so this is a best guess. A song with a clear lead or vocal line works best.`);
+      } catch (err) {
+        // the reason is shown to the person; nothing else to report
+        set({ importing: null });
+        get().say(err instanceof Error ? err.message : 'That file could not be read.');
+      }
+    },
+
+    nextPhrase() {
+      const s = get();
+      if (!s.heard || s.phase === 'forging') return;
+      const idx = (s.heard.idx + 1) % s.heard.phrases.length;
+      const ph = s.heard.phrases[idx];
+      // the composer finds the key from these notes; a hand-picked key would fight the recording
+      set({ heard: { ...s.heard, idx }, motif: fitRange(ph.notes), origin: { name: s.heard.name, from: ph.from, to: ph.to, repeats: ph.repeats, loose: ph.loose }, capture: true, keyLocked: false });
+      void get().forge('new');
     },
 
     toggle() {
@@ -490,7 +566,7 @@ export const useStudio = create<Studio>()((set, get) => {
       if (s.phase === 'forging' || !STYLES[p.styleId]) return;
       get().releaseAll();
       player.setStyle(STYLES[p.styleId]);
-      set({ styleId: p.styleId, motif: p.notes, seed: p.seed, length: p.length, intensity: p.intensity, padKey: p.key, capture: false });
+      set({ styleId: p.styleId, motif: p.notes, seed: p.seed, length: p.length, intensity: p.intensity, drop: p.drop === true, origin: p.origin ?? null, padKey: p.key, capture: false });
       void get().forge('restore');
     },
 

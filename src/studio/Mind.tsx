@@ -75,7 +75,7 @@ function Empty() {
     ['It listens', 'Your notes are weighed against ten scales in all twelve keys to find the one they already belong to.'],
     ['It develops', 'Your motif becomes a four-phrase theme: stated, answered, returned, then turned upside-down to fall home.'],
     ['It harmonises', 'Dozens of chord progressions are auditioned and the one that supports your strongest notes wins.'],
-    ['It orchestrates', 'Movements, key lifts, risers, drops and a finale are laid out and performed by a synthesized ensemble.'],
+    ['It orchestrates', 'Movements, key lifts, risers, drops and a finale are laid out and performed by recorded strings and brass with a synthesized ensemble around them.'],
   ];
   return (
     <div className="px-1">

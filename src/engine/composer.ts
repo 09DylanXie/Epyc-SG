@@ -40,7 +40,7 @@ const ACC_VEL: Record<string, number> = { X: 1, x: 0.84, o: 0.66, g: 0.4, '.': 0
 
 const RANGE: Partial<Record<Inst, [number, number]>> = {
   cello: [36, 69], violin: [55, 93], horns: [41, 74], trumpets: [55, 82], lowBrass: [29, 60], soprano: [58, 84],
-  flute: [60, 93], bamboo: [60, 91], piano: [33, 96], felt: [40, 91], choirAh: [43, 81], choirOo: [43, 79],
+  flute: [60, 93], bamboo: [60, 91], piano: [33, 96], felt: [40, 91], choirAh: [43, 81], choirOo: [43, 79], choirLo: [36, 64],
   lead: [52, 93], bell: [48, 84], glock: [72, 100], celesta: [60, 96], harp: [40, 93], zither: [48, 88],
   strings: [36, 93], pluck: [52, 93], organ: [36, 84], ePiano: [45, 88], superSaw: [48, 88], guitar: [28, 79], cowbell: [55, 91],
 };
@@ -81,6 +81,15 @@ export function compose(input: ComposeInput): Score {
   // ── 1. the notes ────────────────────────────────────────────────
   let played = input.notes.filter((n) => Number.isFinite(n)).slice(0, 16);
   if (!played.length) played = [62, 65, 69, 67, 64];
+
+  if (input.origin) {
+    const mmss = (x: number) => `${Math.floor(x / 60)}:${String(Math.floor(x % 60)).padStart(2, '0')}`;
+    const span = mmss(input.origin.from) === mmss(input.origin.to) ? `at ${mmss(input.origin.from)}` : `between ${mmss(input.origin.from)} and ${mmss(input.origin.to)}`;
+    insights.push({
+      title: `Melody · from ${input.origin.name}`,
+      body: `I listened to your recording and followed its lead line. ${input.origin.loose ? `The melody was hard to make out, so these ${played.length} notes, ${span}, are my best guess at it.` : `The clearest phrase${input.origin.repeats ? ', one whose shape keeps coming back,' : ''} was ${span} — ${played.length} notes.`} Only those notes were kept; everything below is written new around them.`,
+    });
+  }
 
   // ── 2. the key ──────────────────────────────────────────────────
   const guess = detectKey(played, style.modes);
@@ -331,7 +340,73 @@ export function compose(input: ComposeInput): Score {
   const ranks = dA.map((d) => (dMax === dMin ? 0 : Math.round((3 * (d - dMin)) / (dMax - dMin))));
 
   // ── 7. sections ─────────────────────────────────────────────────
-  const specs = style.form(input.length);
+  // build-up & drop: every big arrival gets a run-up that accelerates, a riser, one beat of
+  // silence, and then lands with an impact and a sub drop
+  const dropSpecs = new Set<SectionSpec>();
+  const withDrops = (src: SectionSpec[]): SectionSpec[] => {
+    const out = src.map((x) => ({ ...x, layers: [...x.layers] }));
+    const S = meter.steps;
+    const snare: Inst = style.fx.roll === 'timpani' ? 'snareOrch' : style.fx.roll;
+    // beats, then eighths, then sixteenths, the last half bar at full force
+    const accel = (bars: number) => {
+      let p = '';
+      for (let b = 0; b < bars; b++) {
+        const div = b < bars - 2 ? 4 : b < bars - 1 ? 2 : 1;
+        for (let st = 0; st < S; st++) p += st % div === 0 ? (b === bars - 1 && st >= S / 2 ? 'X' : 'x') : '.';
+      }
+      return p;
+    };
+    const runUp = (bars: number): DrumLayer => ({ k: 'drums', g: { [snare]: accel(bars) }, vel: 0.62, cresc: [0.35, 1.15] });
+    let landed = 0;
+    const isBig = (x: SectionSpec) => x.kind === 'climax' || (x.kind === 'finale' && x.energy >= 0.9);
+    // a style with no marked climax (lo-fi, ambient) drops into its loudest section instead
+    let peak = -1;
+    if (!out.some(isBig)) out.forEach((x, i) => { if (i > 0 && (peak < 0 || x.energy > out[peak].energy)) peak = i; });
+    for (let i = out.length - 1; i > 0; i--) {
+      const target = out[i];
+      if (!(isBig(target) || i === peak)) continue;
+      landed++;
+      const prev = out[i - 1];
+      if (prev.kind === 'build') {
+        prev.layers.push(runUp(prev.bars));
+        prev.exit = ['riser', 'roll', 'cut'];
+      } else {
+        const lift = prev.lift ?? 0;
+        const layers: Layer[] = [];
+        const lead = target.layers.find((l): l is MelLayer => l.k === 'mel');
+        if (lead) layers.push({ k: 'mel', inst: lead.inst, form: 'fragment', oct: lead.oct, bus: lead.bus, vel: 0.7, cresc: [0.6, 1.15] });
+        for (const l of target.layers) {
+          if (l.k === 'pad' || l.k === 'ost' || l.k === 'bass') layers.push({ ...l, from: undefined, to: undefined, every: undefined, vel: (l.vel ?? 0.6) * 0.85, cresc: [0.3, 1.1] });
+        }
+        layers.push(runUp(4));
+        out.splice(i, 0, {
+          name: 'Build-Up', kind: 'build', bars: 4, energy: Math.max(0.6, Math.min(0.75, prev.energy + 0.2)), lift, layers,
+          exit: ['riser', 'roll', 'cut'],
+          say: 'The build-up: the drums speed up bar by bar, everything climbs, then one beat of silence.',
+        });
+      }
+      target.enter = 'big';
+      if (!target.layers.some((l) => l.k === 'drums')) {
+        let boom = '';
+        let taiko = '';
+        for (let st = 0; st < S; st++) {
+          boom += st === 0 ? 'X' : '.';
+          taiko += st === 0 ? 'X' : st % 4 === 0 ? 'x' : st % 4 === 3 && st > S / 2 ? 'o' : '.';
+        }
+        target.layers.push({ k: 'drums', g: { boom, taikoLo: taiko }, vel: style.fx.big.length ? 0.72 : 0.55 });
+      }
+      target.say = `${target.say ?? ''} The drop: it all lands at once.`.trim();
+      dropSpecs.add(target);
+    }
+    if (landed) {
+      insights.push({
+        title: 'Build-up & drop',
+        body: `${landed === 1 ? 'The climax gets' : `All ${landed} big arrivals get`} a run-up: the drums go from beats to eighths to sixteenths, a riser climbs, the band stops for one beat, and then everything lands at once with an impact and a sub drop.`,
+      });
+    }
+    return out;
+  };
+  const specs = input.drop ? withDrops(style.form(input.length)) : style.form(input.length);
   interface SecCtx extends Section {
     chordsByBar: Chord[];
     tonicPc: number;
@@ -755,7 +830,12 @@ export function compose(input: ComposeInput): Score {
   const lowTonic = (sec: SecCtx) => nearestPc(sec.tonicPc, 33);
 
   function enterFx(kind: EnterFx, sec: SecCtx, si: number) {
-    const list = kind === 'big' ? fx.big : kind === 'hit' ? fx.hit : kind === 'drop' ? fx.drop : [];
+    let list: readonly (readonly [Inst, number])[] = kind === 'big' ? fx.big : kind === 'hit' ? fx.hit : kind === 'drop' ? fx.drop : [];
+    if (dropSpecs.has(sec.spec)) {
+      // a drop always lands with weight, even in a style that usually arrives gently
+      const add: [Inst, number][] = [['impact', 0.85], ['subDrop', 0.75], ['crash', 0.4]];
+      list = [...list, ...add.filter(([i]) => !list.some(([j]) => j === i))];
+    }
     for (const [inst, v] of list) {
       emit({
         t: sec.startBeat, d: inst === 'braam' ? meter.beats * 2 : meter.beats, i: inst,
@@ -934,6 +1014,6 @@ export function compose(input: ComposeInput): Score {
 
   return {
     title, styleId: style.id, seed: input.seed, bpm, meter, tonicPc, mode: modeId, keyName, totalBars, totalBeats,
-    musicSec, durationSec, sections, chords, events: out, melody, dna, insights, input: played, baseTonic, progression,
+    musicSec, durationSec, sections, chords, events: out, melody, dna, insights, input: played, baseTonic, progression, origin: input.origin ?? null,
   };
 }

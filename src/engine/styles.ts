@@ -1579,7 +1579,7 @@ const hellforge: StylePreset = {
   chordExt: 'power',
   padVoice: 'guitar',
   reverb: { size: 1.8, damp: 0.5, wet: 0.18, predelay: 0.012 },
-  tilt: { low: 3, high: 2 },
+  tilt: { low: 1, high: 2 },
   mix: { bass: 1.1, drums: 1.1 },
   humanize: 0.15,
   pump: 0.12,
@@ -1906,5 +1906,190 @@ const carousel: StylePreset = {
   },
 };
 
-export const STYLE_LIST: StylePreset[] = [titan, eldritch, requiem, valor, baile, hellforge, column, carousel, ashen, cataclysm, silk, neon, pulse, phantom, breakneck, tape, aether];
+// ═════════════════════════════ TWIN CHOIRS — high and low voices ═════════════════════════════
+
+const choirs: StylePreset = {
+  id: 'choirs',
+  name: 'Twin Choirs',
+  genre: 'High & low voices',
+  tagline: 'Two choirs across a dark nave: the men low and slow, the sopranos high above, answering, then singing as one.',
+  palette: ['#c9d6ff', '#8a7bff', '#0b0a24'],
+  meter: '4/4',
+  tempo: [66, 80],
+  modes: [['aeolian', 1], ['dorian', 0.85], ['harmonic', 0.7], ['phrygian', 0.5], ['ionian', 0.35]],
+  sync: 0.05,
+  chordExt: 'triad',
+  padVoice: 'choirAh',
+  padLow: { below: 60, inst: 'choirLo' },
+  reverb: { size: 4.2, damp: 0.4, wet: 0.4, predelay: 0.035 },
+  tilt: { low: 2.5, high: 1.5 },
+  mix: { choir: 1.05 },
+  humanize: 0.6,
+  fx: { big: [['timpani', 0.7], ['boom', 0.5], ['crash', 0.3]], hit: [['timpani', 0.5]], drop: [['gong', 0.35]], roll: 'timpani', gliss: 'harp' },
+  titles: {
+    a: ['Canticle', 'Vigil', 'Psalm', 'Antiphon', 'Hymn', 'Litany', 'Vespers', 'Chorale'],
+    b: ['the Deep', 'Two Choirs', 'Ash', 'Stone', 'the Nave', 'the Lost', 'Dusk', 'Embers'],
+    join: 'of',
+  },
+  form(len) {
+    const L = lv(len);
+    const up = L >= 1 ? 2 : 0;
+    // the men breathe together on long chords; the sopranos float above in their own time
+    const men = (v: number, o: O<PadLayer> = {}) => pad('choirLo', { bus: 'choir', reg: 45, n: 3, vel: v, ...o });
+    const high = (v: number, o: O<PadLayer> = {}) => pad('choirAh', { bus: 'choir', reg: 65, n: 3, vel: v, ...o });
+    return [
+      sec('Low Chant', 'intro', 4, 0.2, [
+        mel('choirLo', 'statement', { oct: -1, vel: 0.7, bus: 'choir' }),
+        men(0.36, { pedal: true, n: 2, reg: 40 }),
+        pad('organ', { pedal: true, reg: 36, n: 2, vel: 0.16 }),
+      ], { rate: 2, say: 'The men begin alone, low and slow, your notes as a chant.' }),
+
+      sec('Call and Answer', 'theme', 8, 0.42, [
+        mel('choirLo', 'call', { oct: -1, vel: 0.74, bus: 'choir' }),
+        mel('choirAh', 'response', { oct: 1, vel: 0.7, bus: 'choir' }),
+        men(0.3, { art: 1 }),
+        pad('strings', { reg: 50, n: 3, vel: 0.2, art: 4 }),
+        bass('cello', '0--- ---- ---- ---- | 0--- ---- ---- ----', { reg: 36, vel: 0.38 }),
+      ], { rate: 2, say: 'The low choir asks with your theme; the sopranos answer from high above.' }),
+
+      ...when(L >= 1, sec('Antiphon', 'theme', 8, 0.5, [
+        mel('choirAh', 'theme', { oct: 1, vel: 0.78, bus: 'choir' }),
+        counter('choirLo', { reg: 45, vel: 0.6, bus: 'choir' }),
+        pad('choirOo', { bus: 'choir', reg: 57, n: 3, vel: 0.24, art: 1 }),
+        pad('organ', { reg: 43, n: 3, vel: 0.16 }),
+        mel('bell', 'sparse', { vel: 0.3, bus: 'color' }),
+      ], { prog: 'B', rate: 2, say: 'Now the sopranos carry the theme and the men walk a line of their own beneath it.' })),
+
+      sec('Ascent', 'build', 4, 0.6, [
+        mel('choirStac', 'fragment', { vel: 0.66, bus: 'choir', cresc: [0.6, 1.15] }),
+        men(0.4, { pat: 'X--- ---- X--- ---- | X--- X--- X-X- X-X-', cresc: [0.6, 1.2] }),
+        high(0.3, { cresc: [0.4, 1.2] }),
+        pad('strings', { reg: 52, n: 4, vel: 0.3, cresc: [0.5, 1.2] }),
+        drums({ timpani: '.... .... .... .... | X... .... X... .... | X... X... X... X... | X.X. X.X. XXXX XXXX' }, { vel: 0.5, cresc: [0.5, 1.15] }),
+      ], { exit: ['roll', 'swell'], say: 'Both choirs climb your first notes, closer together with every bar.' }),
+
+      sec('Both Choirs', 'climax', 8, 0.95, [
+        mel('choirAh', 'theme', { oct: 1, vel: 0.92, bus: 'choir', dbl: [{ inst: 'choirLo', oct: -1, vel: 0.74, bus: 'choir' }, { inst: 'strings', oct: 1, vel: 0.5 }] }),
+        men(0.5, { pat: 'X--- ---- ---- ---- | X--- ---- X--- ----' }),
+        high(0.36),
+        pad('organ', { reg: 43, n: 4, vel: 0.28 }),
+        bass('lowBrass', '0--- ---- ---- ---- | 0--- ---- 5--- ----', { reg: 36, vel: 0.5, bus: 'brass' }),
+        bass('cello', '0--- ---- ---- ---- | 0--- ---- ---- ----', { reg: 36, vel: 0.5 }),
+        drums({ timpani: 'X... .... .... .... | X... .... x... x...', boom: 'X... .... .... .... | .... .... .... ....', crash: 'X... .... .... .... | .... .... .... ....' }, { vel: 0.74 }),
+      ], { enter: 'big', say: 'Two choirs become one: the sopranos on top, the men an octave and more below, the organ underneath.' }),
+
+      ...when(L >= 1, sec('One Voice', 'break', 8, 0.22, [
+        mel('soprano', 'broad', { vel: 0.6 }),
+        pad('choirOo', { bus: 'choir', reg: 57, n: 3, vel: 0.22, art: 4 }),
+        men(0.26, { pedal: true, n: 2, reg: 40, art: 4 }),
+      ], { rate: 2, exit: ['swell'], say: 'Everyone falls silent but one soprano, with the men humming a single low note.' })),
+
+      ...when(L >= 1, sec('Gloria', 'finale', 8, 1, [
+        mel('choirAh', 'theme', { oct: 1, vel: 0.96, bus: 'choir', dbl: [{ inst: 'choirLo', oct: -1, vel: 0.78, bus: 'choir' }, { inst: 'strings', oct: 1, vel: 0.56 }, { inst: 'horns', oct: 0, vel: 0.42, bus: 'brass' }] }),
+        men(0.54, { pat: 'X--- ---- ---- ---- | X--- ---- X--- ----' }),
+        high(0.4),
+        pad('organ', { reg: 43, n: 4, vel: 0.32 }),
+        mel('bell', 'sparse', { vel: 0.38, bus: 'color' }),
+        bass('lowBrass', '0--- ---- ---- ---- | 0--- ---- 5--- ----', { reg: 36, vel: 0.54, bus: 'brass' }),
+        bass('cello', '0--- ---- ---- ---- | 0--- ---- ---- ----', { reg: 36, vel: 0.52 }),
+        drums({ timpani: 'X... .... .... .... | X... .... x... x...', boom: 'X... .... .... .... | .... .... .... ....', crash: 'X... .... .... .... | .... .... .... ....' }, { vel: 0.8 }),
+      ], { prog: 'final', lift: up, enter: 'big', say: 'A whole step higher, with a bell tolling between the phrases.' })),
+
+      sec('Amen', 'outro', 4, 0.15, [
+        men(0.4, { pedal: true, n: 3, art: 4 }),
+        high(0.3, { pedal: true, art: 4 }),
+        pad('organ', { pedal: true, reg: 36, n: 2, vel: 0.2, art: 4 }),
+      ], { prog: 'pedal', lift: up, say: 'One last chord from both choirs, high and low, left to ring in the stone.' }),
+    ];
+  },
+};
+
+// ═════════════════════════════ DARK CELLO — noir strings ═════════════════════════════
+
+const darkcello: StylePreset = {
+  id: 'darkcello',
+  name: 'Dark Cello',
+  genre: 'Cello section · noir',
+  tagline: 'Cellos in the dark: a slow lament that gathers into a storm of low strings and drums.',
+  palette: ['#d98f5c', '#8c2f39', '#120708'],
+  meter: '4/4',
+  tempo: [68, 84],
+  modes: [['harmonic', 1], ['aeolian', 0.95], ['phrygian', 0.7], ['dorian', 0.4]],
+  sync: 0.15,
+  chordExt: 'seventh',
+  padVoice: 'cello',
+  reverb: { size: 3.2, damp: 0.5, wet: 0.3, predelay: 0.025 },
+  tilt: { low: -0.5, high: 1.5 },
+  humanize: 0.75,
+  fx: { big: [['timpani', 0.8], ['boom', 0.7], ['crash', 0.35]], hit: [['timpani', 0.6]], drop: [['gong', 0.35]], roll: 'timpani', run: 'strings' },
+  titles: {
+    a: ['Black', 'Hollow', 'Drowned', 'Silent', 'Last', 'Cold', 'Weeping', 'Ashen'],
+    b: ['Elegy', 'Nocturne', 'Lament', 'Waters', 'Hour', 'Vigil', 'Threnody', 'Requiem'],
+    join: '',
+  },
+  form(len) {
+    const L = lv(len);
+    const up = L >= 1 ? 1 : 0;
+    const drone = (v: number, o: O<PadLayer> = {}) => pad('strings', { pedal: true, reg: 55, n: 2, vel: v * 0.8, art: 4, ...o });
+    const pulse = (v: number, o: O<OstLayer> = {}) => ost('spiccato', '0.0. 0.0. 0.0. 0.00 | 0.0. 0.0. 0.00 2.1.', { reg: 52, vel: v, acc: 'X.o. x.o. X.o. x.oo', ...o });
+    return [
+      sec('Alone', 'intro', 4, 0.2, [
+        mel('cello', 'statement', { vel: 0.68 }),
+        drone(0.26),
+        mel('felt', 'sparse', { oct: 1, vel: 0.3, bus: 'color' }),
+      ], { rate: 2, say: 'One section of cellos, alone in the dark, playing your notes slowly.' }),
+
+      sec('Lament', 'theme', 8, 0.4, [
+        mel('cello', 'theme', { vel: 0.76 }),
+        pad('strings', { reg: 62, n: 3, vel: 0.22, art: 1 }),
+        ost('pizz', '0... .... 2... .... | 3... .... 2... ....', { reg: 50, vel: 0.36, bus: 'color' }),
+        bass('cello', '0--- ---- ---- ---- | 0--- ---- ---- ----', { reg: 36, vel: 0.42 }),
+      ], { rate: 2, say: 'The cellos sing your theme as a lament, plucked basses walking under them.' }),
+
+      ...when(L >= 1, sec('Shadows', 'theme', 8, 0.5, [
+        mel('cello', 'inverted', { vel: 0.74 }),
+        ost('tremolo', '0--- ---- ---- ---- | 2--- ---- ---- ----', { reg: 62, vel: 0.26 }),
+        pad('choirOo', { bus: 'choir', reg: 64, n: 3, vel: 0.2, art: 1 }),
+        bass('cello', '0--- ---- 5--- ---- | 0--- ---- ---- ----', { reg: 36, vel: 0.44 }),
+        drums({ timpani: 'X... .... .... .... | .... .... .... ....' }, { vel: 0.4, every: 2 }),
+      ], { prog: 'B', rate: 2, say: 'The theme turned upside down, trembling violins far above and a hidden choir.' })),
+
+      sec('Gathering', 'build', 4, 0.62, [
+        mel('cello', 'fragment', { vel: 0.72, cresc: [0.7, 1.15] }),
+        pulse(0.5, { cresc: [0.6, 1.2] }),
+        pad('strings', { reg: 62, n: 3, vel: 0.28, cresc: [0.5, 1.25] }),
+        drums({ taikoLo: 'X... .... X... .... | X... .... X... X...', timpani: '.... .... .... .... | .... .... .... .... | X... X... X... X... | X.X. X.X. XXXX XXXX' }, { vel: 0.56, cresc: [0.5, 1.15] }),
+      ], { exit: ['roll', 'run'], say: 'The cellos dig into your first notes, the basses start to drive, and the drums close in.' }),
+
+      sec('Black Waters', 'climax', 8, 0.95, [
+        mel('cello', 'theme', { vel: 0.92, dbl: [{ inst: 'strings', oct: 1, vel: 0.6 }, { inst: 'horns', oct: 0, vel: 0.44, bus: 'brass' }] }),
+        pulse(0.6),
+        pad('choirLo', { bus: 'choir', reg: 52, n: 2, vel: 0.32 }),
+        bass('lowBrass', '0--- ---- ---- ---- | 0--- ---- 5--- ----', { reg: 33, vel: 0.46, bus: 'brass' }),
+        drums({ taikoLo: 'X... ..x. X... .... | X... ..x. X.x. x...', boom: 'X... .... .... .... | .... .... .... ....', timpani: 'X... .... x... .... | X... .... x.x. x...', crash: 'X... .... .... .... | .... .... .... ....' }, { vel: 0.8, fill: { taikoLo: 'X.x. X.x. XxXx XxXx', timpani: 'X.o. x.o. x.xx xxxx' } }),
+      ], { enter: 'big', say: 'The storm breaks: the cellos roar your theme with the whole string section an octave above and horns inside it.' }),
+
+      ...when(L >= 1, sec('Embers', 'break', 8, 0.2, [
+        mel('cello', 'broad', { vel: 0.62 }),
+        mel('felt', 'sparse', { oct: 1, vel: 0.32, bus: 'color' }),
+        drone(0.22),
+      ], { rate: 2, exit: ['swell'], say: 'Only the cellos again, slower, with a piano dropping single notes like rain.' })),
+
+      ...when(L >= 1, sec('Last Light', 'finale', 8, 1, [
+        mel('cello', 'theme', { vel: 0.95, dbl: [{ inst: 'strings', oct: 1, vel: 0.64 }, { inst: 'horns', oct: 0, vel: 0.5, bus: 'brass' }, { inst: 'choirAh', oct: 1, vel: 0.36, bus: 'choir' }] }),
+        pulse(0.64),
+        pad('choirLo', { bus: 'choir', reg: 52, n: 2, vel: 0.36 }),
+        bass('lowBrass', '0--- ---- ---- ---- | 0--- ---- 5--- ----', { reg: 33, vel: 0.5, bus: 'brass' }),
+        drums({ taikoLo: 'X... ..x. X... .... | X... ..x. X.x. x...', boom: 'X... .... .... .... | .... .... .... ....', timpani: 'X... .... x... .... | X... .... x.x. x...', crash: 'X... .... .... .... | .... .... .... ....' }, { vel: 0.86, fill: { taikoLo: 'X.x. X.x. XxXx XxXx', timpani: 'X.o. x.o. x.xx xxxx' } }),
+      ], { prog: 'final', lift: up, enter: 'big', say: 'One last time, a semitone higher, a choir joining the cellos at the top.' })),
+
+      sec('Fade', 'outro', 4, 0.12, [
+        mel('cello', 'sparse', { vel: 0.56, to: 3 }),
+        drone(0.24, { art: 4 }),
+      ], { prog: 'pedal', lift: up, say: 'The cellos let the last note go into the dark.' }),
+    ];
+  },
+};
+
+export const STYLE_LIST: StylePreset[] = [titan, eldritch, requiem, choirs, darkcello, valor, baile, hellforge, column, carousel, ashen, cataclysm, silk, neon, pulse, phantom, breakneck, tape, aether];
 export const STYLES: Record<string, StylePreset> = Object.fromEntries(STYLE_LIST.map((s) => [s.id, s]));

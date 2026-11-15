@@ -3,8 +3,9 @@
  * mastering chain, built on any BaseAudioContext — the live one you hear and the offline one
  * that renders your download are the same code, so the file is what you heard.
  *
- * Nothing here is a recording. Sustained voices are oscillators and PeriodicWaves; everything
- * struck, plucked or hit is computed in dsp.ts and cached as AudioBuffers.
+ * Strings, brass and flute are real recordings (VSCO 2: Community Edition, CC0 — see
+ * public/samples/CREDITS.txt), pitched and looped here. Everything else is synthesized: sustained
+ * voices from oscillators and PeriodicWaves, struck, plucked and hit things computed in dsp.ts.
  */
 import { mtof } from '../theory';
 import type { Bus, Inst, NoteEv, StylePreset } from '../types';
@@ -12,7 +13,8 @@ import {
   BAMBOO_SPECTRUM, FLUTE_SPECTRUM, ORGAN_SPECTRUM, PERC, pianoSpectrum, renderBell, renderImpulse, renderPerc,
   renderPluck, vowelSpectrum, type BellKind, type Chans, type PluckKind, type Vowel,
 } from './dsp';
-import { GAIN } from './levels';
+import { GAIN, SYNTH_GAIN } from './levels';
+import SAMPLE_MAP from './sampleMap.json';
 import type { SampleDone, SampleJob } from './samples.worker';
 
 const BUF_SR = 44100;
@@ -79,6 +81,39 @@ function irBuffer(sr: number, size: number, damp: number): AudioBuffer {
     keepImpulse(key, b);
   }
   return b;
+}
+
+// ───────────────────────────── recorded notes ─────────────────────────────
+// Keys look like s:<set>:<root>. Each file is one note, trimmed and levelled when the set was built
+// (scripts/build-samples.mjs); the manifest says what pitch it really plays and how much gain it still needs.
+
+type SampleRow = [root: number, cents: number, gain: number];
+const SETS = (SAMPLE_MAP as unknown as { sets: Record<string, SampleRow[]> }).sets;
+/** where the sound starts in each decoded file (MP3 decoders add a little silence in front) */
+const onsetCache = new Map<string, number>();
+const failed = new Set<string>();
+let decoder: BaseAudioContext | null = null;
+
+async function loadSample(key: string): Promise<void> {
+  if (bufCache.has(key) || failed.has(key)) return;
+  const [, set, root] = key.split(':');
+  try {
+    if (typeof window === 'undefined') throw new Error('no audio here');
+    decoder ??= new OfflineAudioContext(2, 1, BUF_SR);
+    const res = await fetch(`/samples/${set}/${root}.mp3`);
+    if (!res.ok) throw new Error(String(res.status));
+    const b = await decoder.decodeAudioData(await res.arrayBuffer());
+    const d = b.getChannelData(0);
+    let peak = 0;
+    for (let i = 0; i < d.length; i++) peak = Math.max(peak, Math.abs(d[i]));
+    let on = 0;
+    while (on < d.length && Math.abs(d[on]) < peak * 0.02) on++;
+    onsetCache.set(key, Math.max(0, on / b.sampleRate - 0.004));
+    bufCache.set(key, b);
+  } catch {
+    // offline or blocked: this note falls back to its synthesized voice
+    failed.add(key);
+  }
 }
 
 // ───────────────────────────── off-thread rendering ─────────────────────────────
@@ -182,6 +217,15 @@ function pump() {
 function want(key: string, urgent = false): Promise<void> {
   if (have(key)) return Promise.resolve();
   let p = inflight.get(key);
+  if (key.charCodeAt(0) === 115 /* s */) {
+    if (!p) {
+      p = loadSample(key).then(() => {
+        inflight.delete(key);
+      });
+      inflight.set(key, p);
+    }
+    return p;
+  }
   if (p) {
     // already asked for at leisure, now needed at once
     const at = urgent ? queue.findIndex((t) => t.key === key) : -1;
@@ -500,6 +544,166 @@ const struck = (kind: BellKind): VoiceFn => (g, n) => {
   return n.t + buf.duration + 0.06;
 };
 
+// ── recorded instruments ──
+
+/** [lowest midi, highest midi, set, darker (lowpass ceiling Hz)] */
+type Zone = readonly [lo: number, hi: number, set: string, dark?: number];
+interface SampledP {
+  inst: Inst;
+  zones: readonly Zone[];
+  /** what plays a tremolo-marked note */
+  trem?: readonly Zone[];
+  a: number;
+  r: number;
+  /** let the recording decay by itself (spiccato) */
+  short?: boolean;
+  glide?: number;
+  /** the synthesized voice, for notes played before their recording has arrived */
+  fb: VoiceFn;
+}
+
+interface Picked {
+  key: string;
+  root: number;
+  cents: number;
+  gain: number;
+  dark?: number;
+}
+
+function pickSample(zones: readonly Zone[], m: number): Picked | null {
+  const z = zones.find(([lo, hi]) => m >= lo && m <= hi) ?? zones[m < zones[0][0] ? 0 : zones.length - 1];
+  const rows = SETS[z[2]];
+  if (!rows?.length) return null;
+  let best = rows[0];
+  for (const r of rows) {
+    const d = Math.abs(r[0] - m);
+    const bd = Math.abs(best[0] - m);
+    // on a tie, take the recording above: shifting down sounds more natural than up
+    if (d < bd || (d === bd && r[0] > best[0])) best = r;
+  }
+  return { key: `s:${z[2]}:${best[0]}`, root: best[0], cents: best[1], gain: best[2], dark: z[3] };
+}
+
+const EQ_UP = new Float32Array(33).map((_, i) => Math.sin((Math.PI / 2) * (i / 32)));
+const EQ_DOWN = new Float32Array(33).map((_, i) => Math.cos((Math.PI / 2) * (i / 32)));
+/** where the held part of every recording begins (seconds into the file) */
+const LOOP_FROM = 1;
+/** crossfade between passes over the held part */
+const XFADE = 0.45;
+/** the fade baked into the end of every file */
+const BAKED_FADE = 0.3;
+
+/** the lab can switch the recordings off, to compare against the synthesized voices */
+export const RECORDINGS = { on: true };
+/** how many notes fell back to the synthesized voice because their recording had not arrived (diagnostics) */
+export const STAND_INS = { n: 0, last: '' };
+
+const sampled = (p: SampledP): VoiceFn => (g, n) => {
+  // the stand-in is calibrated to its own level, not the recording's
+  const standIn = () => {
+    n.vca.gain.value = (SYNTH_GAIN[p.inst] ?? GAIN[p.inst]) / GAIN[p.inst];
+    return p.fb(g, n);
+  };
+  if (!RECORDINGS.on) return standIn();
+  const pick = pickSample(n.a === 3 && p.trem ? p.trem : p.zones, n.m);
+  const buf = pick && bufCache.get(pick.key);
+  if (!pick || !buf) {
+    if (pick && !failed.has(pick.key)) void want(pick.key, true);
+    STAND_INS.n++;
+    STAND_INS.last = `${p.inst}@${n.m}`;
+    return standIn();
+  }
+  const on = onsetCache.get(pick.key) ?? 0;
+  const rate = Math.pow(2, (n.m - pick.root) / 12 - pick.cents / 1200);
+  const pk = Math.pow(n.v, 1.5) * pick.gain;
+  const amp = g.gn(0);
+  // softer playing is darker, as it is with a real bow or breath
+  const soft = n.a === 4 ? 0.6 : 1;
+  const top = clamp((2200 + 13000 * n.v * n.v) * soft, 1400, pick.dark ?? 16000);
+  const tone = g.bq('lowpass', top, 0.5);
+  tone.connect(amp);
+
+  let end: number;
+  if (p.short) {
+    const src = g.buf(buf, n.t, rate, on);
+    src.connect(tone);
+    const ring = (buf.duration - on) / rate;
+    const hold = Math.min(Math.max(n.d, 0.1), ring);
+    amp.gain.setValueAtTime(0, n.t);
+    amp.gain.linearRampToValueAtTime(pk, n.t + 0.002);
+    amp.gain.setTargetAtTime(0, n.t + hold, p.r / 4);
+    end = Math.min(n.t + ring, n.t + hold + p.r * 2);
+  } else {
+    end = shape(amp.gain, n, pk, p.a, p.r);
+    // pass over the held part of the note again and again, crossfading, for as long as it is held
+    let t = n.t;
+    let off = on;
+    for (let pass = 0; pass < 16; pass++) {
+      const src = g.buf(buf, t, rate, off);
+      const sg = g.gn(pass ? 0 : 1);
+      src.connect(sg);
+      sg.connect(tone);
+      if (pass) sg.gain.setValueCurveAtTime(EQ_UP, t, XFADE);
+      else if (n.from !== undefined && p.glide) {
+        src.playbackRate.setValueAtTime(rate * Math.pow(2, (n.from - n.m) / 12), t);
+        src.playbackRate.exponentialRampToValueAtTime(rate, t + p.glide);
+      }
+      const runsOut = t + (buf.duration - off) / rate;
+      if (runsOut >= end) break;
+      const next = runsOut - BAKED_FADE / rate - XFADE;
+      if (next <= t + XFADE) break;
+      sg.gain.setValueCurveAtTime(EQ_DOWN, next, XFADE);
+      t = next;
+      off = on + LOOP_FROM;
+    }
+  }
+  amp.connect(n.vca);
+  return end;
+};
+
+/**
+ * A section of singers rather than one waveform: every note is several voices, each a little off
+ * pitch, starting a little late, wobbling at its own rate and standing in its own place on the
+ * risers, with breath in the sound.
+ */
+const choir = (p: { vowels: readonly Vowel[]; n: number; spread: number; a: number; r: number; vib: number; air: number; bright?: number; width?: number }): VoiceFn => (g, n) => {
+  const pk = (Math.pow(n.v, 1.5) * 1.6) / Math.sqrt(p.n);
+  const amp = g.gn(0);
+  const end = shape(amp.gain, n, pk, p.a, p.r);
+  let rs = Math.floor(n.seed * 233280);
+  const rnd = () => (rs = (rs * 9301 + 49297) % 233280) / 233280;
+  const width = p.width ?? 0.75;
+  for (let k = 0; k < p.n; k++) {
+    const late = rnd() * 0.04;
+    const wave = vowel(p.vowels[k % p.vowels.length], k % 3, p.bright ?? 0) as (g: AudioGraph, n: N) => PeriodicWave;
+    const o = g.osc(wave(g, n), n.f, n.t + late, (rnd() - 0.5) * 2 * p.spread);
+    // nobody holds a pitch dead still: a slow drift and their own vibrato
+    const wob = g.gn(0);
+    wob.gain.setValueAtTime(0, n.t);
+    wob.gain.linearRampToValueAtTime(p.vib * (0.55 + 0.9 * rnd()), n.t + 0.35 + rnd() * 0.5);
+    g.mod(g.lfo[k % g.lfo.length], wob);
+    wob.connect(o.detune);
+    const og = g.gn(0);
+    og.gain.setValueAtTime(0, n.t + late);
+    og.gain.linearRampToValueAtTime(1, n.t + late + 0.02);
+    const pan = g.ctx.createStereoPanner();
+    pan.pan.value = p.n > 1 ? ((k / (p.n - 1)) * 2 - 1) * width : 0;
+    o.connect(og);
+    og.connect(pan);
+    pan.connect(amp);
+  }
+  if (p.air) {
+    const noise = g.buf(percBuffer('noise'), n.t, 1, n.seed * 1.5, true);
+    const bp = g.bq('bandpass', clamp(n.f * 3, 700, 3200), 0.9);
+    const ag = g.gn(p.air);
+    noise.connect(bp);
+    bp.connect(ag);
+    ag.connect(amp);
+  }
+  amp.connect(n.vca);
+  return end;
+};
+
 const vowel = (v: Vowel, variant: number, bright = 0): WaveSrc => (g, n) => {
   const anchor = Math.round(n.m / 3) * 3;
   return g.pw(`v:${v}:${anchor}:${variant}:${bright}`, () => vowelSpectrum(mtof(anchor), v, bright), variant);
@@ -749,22 +953,66 @@ const SIN = 'sine';
 const organW = fixedWave('organ', ORGAN_SPECTRUM);
 const drum = (rev: number): StripSpec => ({ rev });
 
+/** which recordings cover which part of each instrument's range */
+const Z = {
+  strings: [[0, 54, 'celloSec'], [55, 66, 'violaSec'], [67, 127, 'violinSec']],
+  trem: [[0, 56, 'celloTrem'], [57, 127, 'violinTrem']],
+  spic: [[0, 56, 'celloSpic'], [57, 127, 'violinSpic']],
+  // the horn recordings skip from 60 to 74: a darkened trumpet sits in the hole
+  horns: [[0, 64, 'horn'], [65, 70, 'trumpet', 2600], [71, 127, 'horn']],
+  lowBrass: [[0, 45, 'tuba'], [46, 127, 'trombone']],
+} as const satisfies Record<string, readonly Zone[]>;
+const SAMPLED_ZONES: Partial<Record<Inst, (readonly Zone[])[]>> = {
+  strings: [Z.strings, Z.trem], tremolo: [Z.trem], spiccato: [Z.spic], cello: [[[0, 127, 'celloSec']], [[0, 127, 'celloTrem']]],
+  violin: [[[0, 127, 'soloViolin']], [[0, 127, 'violinTrem']]], horns: [Z.horns], trumpets: [[[0, 127, 'trumpet']]],
+  lowBrass: [Z.lowBrass], flute: [[[0, 127, 'flute']]],
+};
+
 const DEFS: Record<Inst, Def> = {
   // ── orchestra ──
-  strings: { v: sus({ w: [[SAW, -9, 1], [SAW, 8, 1]], cut: 4.6, cutMax: 5600, a: 0.13, r: 0.42 }), s: { rev: 0.95, ch: 0.6, hp: 70 }, rel: 0.4 },
-  tremolo: { v: sus({ w: [[SAW, -9, 1], [SAW, 8, 1]], cut: 6, cutMax: 7000, a: 0.06, r: 0.3, trem: true }), s: { rev: 0.9, ch: 0.5, hp: 90 }, rel: 0.3 },
+  strings: {
+    v: sampled({ inst: 'strings', zones: Z.strings, trem: Z.trem, a: 0.05, r: 0.42, fb: sus({ w: [[SAW, -9, 1], [SAW, 8, 1]], cut: 4.6, cutMax: 5600, a: 0.13, r: 0.42 }) }),
+    s: { rev: 0.85, hp: 60 },
+    rel: 0.4,
+  },
+  tremolo: {
+    v: sampled({ inst: 'tremolo', zones: Z.trem, a: 0.03, r: 0.3, fb: sus({ w: [[SAW, -9, 1], [SAW, 8, 1]], cut: 6, cutMax: 7000, a: 0.06, r: 0.3, trem: true }) }),
+    s: { rev: 0.8, hp: 80 },
+    rel: 0.3,
+  },
   spiccato: {
-    v: dec({ w: [[SAW, -7, 1], [SAW, 6, 1]], cutHi: 9, cutLo: 2.2, ftau: 0.045, cutMax: 9000, atk: 0.004, tau: 0.075, min: 0.3, r: 0.08, on: ['bite', 0.18] }),
-    s: { rev: 0.7, ch: 0.35, hp: 70 },
+    v: sampled({ inst: 'spiccato', zones: Z.spic, a: 0.002, r: 0.08, short: true, fb: dec({ w: [[SAW, -7, 1], [SAW, 6, 1]], cutHi: 9, cutLo: 2.2, ftau: 0.045, cutMax: 9000, atk: 0.004, tau: 0.075, min: 0.3, r: 0.08, on: ['bite', 0.18] }) }),
+    s: { rev: 0.6, hp: 60 },
   },
   pizz: { v: plucked('pizz'), s: { rev: 0.75 } },
-  cello: { v: sus({ w: [[SAW, 0, 1], [SAW, 5, 0.5]], cut: 4.2, cutMax: 4200, q: 0.9, a: 0.07, r: 0.22, vib: [20, 0.22, 0], glide: 0.09 }), s: { rev: 0.9, hp: 55 }, rel: 0.25 },
-  violin: { v: sus({ w: [[SAW, 0, 1], [SAW, -4, 0.45]], cut: 4.5, cutMax: 7500, q: 0.9, a: 0.06, r: 0.2, vib: [24, 0.2, 1], glide: 0.07 }), s: { rev: 1, del: 0.3, hp: 160 }, rel: 0.22 },
-  horns: { v: sus({ w: [[SAW, -4, 1], [SAW, 5, 1]], cut: 3.2, cutMax: 2600, fenv: 1.1, q: 0.8, a: 0.07, r: 0.2 }), s: { rev: 1.1, ch: 0.25, hp: 60 }, rel: 0.22 },
-  trumpets: { v: sus({ w: [[SAW, -3, 1], [SAW, 4, 1]], cut: 6.5, cutMax: 6800, fenv: 1.4, q: 1.3, a: 0.035, r: 0.14 }), s: { rev: 0.9, ch: 0.2, hp: 120 }, rel: 0.18 },
-  lowBrass: { v: sus({ w: [[SAW, -5, 1], [SAW, 4, 1], [SQ, 0, 0.25]], cut: 5, cutMax: 2400, fenv: 1.2, q: 1.1, a: 0.06, r: 0.22 }), s: { rev: 0.8, ch: 0.2 }, rel: 0.22 },
-  choirAh: { v: sus({ w: [[vowel('a', 0), -7, 1], [vowel('a', 1), 8, 1]], a: 0.16, r: 0.45, vib: [9, 0.3, 1] }), s: { rev: 1.2, ch: 0.7, hp: 80 }, rel: 0.4 },
-  choirOo: { v: sus({ w: [[vowel('o', 0), -6, 1], [vowel('u', 1), 7, 1]], a: 0.3, r: 0.6, vib: [7, 0.4, 0] }), s: { rev: 1.2, ch: 0.7, hp: 80 }, rel: 0.5 },
+  cello: {
+    v: sampled({ inst: 'cello', zones: [[0, 127, 'celloSec']], trem: [[0, 127, 'celloTrem']], a: 0.04, r: 0.3, glide: 0.09, fb: sus({ w: [[SAW, 0, 1], [SAW, 5, 0.5]], cut: 4.2, cutMax: 4200, q: 0.9, a: 0.07, r: 0.22, vib: [20, 0.22, 0], glide: 0.09 }) }),
+    s: { rev: 0.8, hp: 45 },
+    rel: 0.3,
+  },
+  violin: {
+    v: sampled({ inst: 'violin', zones: [[0, 127, 'soloViolin']], trem: [[0, 127, 'violinTrem']], a: 0.03, r: 0.25, glide: 0.07, fb: sus({ w: [[SAW, 0, 1], [SAW, -4, 0.45]], cut: 4.5, cutMax: 7500, q: 0.9, a: 0.06, r: 0.2, vib: [24, 0.2, 1], glide: 0.07 }) }),
+    s: { rev: 0.9, del: 0.3, hp: 160 },
+    rel: 0.25,
+  },
+  horns: {
+    v: sampled({ inst: 'horns', zones: Z.horns, a: 0.03, r: 0.25, fb: sus({ w: [[SAW, -4, 1], [SAW, 5, 1]], cut: 3.2, cutMax: 2600, fenv: 1.1, q: 0.8, a: 0.07, r: 0.2 }) }),
+    s: { rev: 1, hp: 50 },
+    rel: 0.25,
+  },
+  trumpets: {
+    v: sampled({ inst: 'trumpets', zones: [[0, 127, 'trumpet']], a: 0.015, r: 0.18, fb: sus({ w: [[SAW, -3, 1], [SAW, 4, 1]], cut: 6.5, cutMax: 6800, fenv: 1.4, q: 1.3, a: 0.035, r: 0.14 }) }),
+    s: { rev: 0.85, hp: 110 },
+    rel: 0.18,
+  },
+  lowBrass: {
+    v: sampled({ inst: 'lowBrass', zones: Z.lowBrass, a: 0.03, r: 0.22, fb: sus({ w: [[SAW, -5, 1], [SAW, 4, 1], [SQ, 0, 0.25]], cut: 5, cutMax: 2400, fenv: 1.2, q: 1.1, a: 0.06, r: 0.22 }) }),
+    s: { rev: 0.75, hp: 30 },
+    rel: 0.22,
+  },
+  choirAh: { v: choir({ vowels: ['a', 'a', 'o'], n: 5, spread: 11, a: 0.16, r: 0.45, vib: 10, air: 0.05 }), s: { rev: 1.15, ch: 0.25, hp: 90 }, rel: 0.4 },
+  choirOo: { v: choir({ vowels: ['o', 'u'], n: 5, spread: 9, a: 0.3, r: 0.6, vib: 7, air: 0.04 }), s: { rev: 1.15, ch: 0.25, hp: 90 }, rel: 0.5 },
+  choirLo: { v: choir({ vowels: ['o', 'a'], n: 6, spread: 8, a: 0.22, r: 0.5, vib: 6, air: 0.035, bright: -4, width: 0.55 }), s: { rev: 1.05, ch: 0.2, hp: 50 }, rel: 0.45 },
   choirStac: {
     v: dec({ w: [[vowel('a', 0), -8, 1], [vowel('a', 1), 9, 1]], atk: 0.012, tau: 0.11, min: 0.34, r: 0.1, on: ['breath', 0.2] }),
     s: { rev: 1, ch: 0.6, hp: 80 },
@@ -778,7 +1026,11 @@ const DEFS: Record<Inst, Def> = {
   glock: { v: struck('glock'), s: { rev: 0.9, del: 0.3 } },
   celesta: { v: struck('celesta'), s: { rev: 1, del: 0.3 } },
   organ: { v: sus({ w: [[organW, 0, 1], [organW, 4, 0.7], [SIN, 0, 0.5, -1]], a: 0.035, r: 0.3, on: ['breath', 0.08] }), s: { rev: 1.2, lp: 6500 }, rel: 0.35 },
-  flute: { v: sus({ w: [[fixedWave('flute', FLUTE_SPECTRUM), 0, 1]], a: 0.06, r: 0.14, vib: [13, 0.25, 0], air: 0.07, on: ['breath', 0.25], glide: 0.04 }), s: { rev: 1.1, del: 0.25, hp: 200 }, rel: 0.18 },
+  flute: {
+    v: sampled({ inst: 'flute', zones: [[0, 127, 'flute']], a: 0.03, r: 0.16, glide: 0.04, fb: sus({ w: [[fixedWave('flute', FLUTE_SPECTRUM), 0, 1]], a: 0.06, r: 0.14, vib: [13, 0.25, 0], air: 0.07, on: ['breath', 0.25], glide: 0.04 }) }),
+    s: { rev: 1, del: 0.25, hp: 200 },
+    rel: 0.18,
+  },
   bamboo: {
     v: sus({ w: [[fixedWave('bamboo', BAMBOO_SPECTRUM), 0, 1]], a: 0.05, r: 0.16, vib: [26, 0.3, 0], air: 0.12, scoop: 45, on: ['breath', 0.35], glide: 0.08 }),
     s: { rev: 1.2, del: 0.3, hp: 180 },
@@ -844,44 +1096,53 @@ const DEFS: Record<Inst, Def> = {
 
 /** transient layers each instrument needs alongside its own samples */
 const EXTRA: Partial<Record<Inst, string[]>> = {
-  spiccato: ['bite'], piano: ['thump'], felt: ['thump'], soprano: ['breath'], organ: ['breath'], choirStac: ['breath'],
+  spiccato: ['bite'], choirAh: ['noise'], choirOo: ['noise'], choirLo: ['noise'], piano: ['thump'], felt: ['thump'], soprano: ['breath'], organ: ['breath'], choirStac: ['breath'],
   flute: ['breath', 'noise'], bamboo: ['breath', 'noise'], riser: ['noise'], timpani: ['timpani'],
 };
 const PLUCKS = new Set<string>(['harp', 'zither', 'pizz']);
 const BELLS = new Set<string>(['bell', 'glock', 'celesta']);
 
 /** Renders every sample a set of notes will need, yielding to the UI as it goes. */
-export async function prepareSamples(notes: Iterable<{ i: Inst; m: number }>, onProgress?: (p: number) => void, urgent = true): Promise<void> {
+export async function prepareSamples(notes: Iterable<{ i: Inst; m: number; a?: number }>, onProgress?: (p: number) => void, urgent = true): Promise<void> {
   const keys = new Set<string>();
-  for (const { i, m } of notes) {
+  for (const { i, m, a } of notes) {
+    const zs = RECORDINGS.on ? SAMPLED_ZONES[i] : undefined;
+    if (zs) {
+      const p = pickSample(a === 3 && zs[1] ? zs[1] : zs[0], m);
+      if (p && !failed.has(p.key)) keys.add(p.key);
+    }
     if (PLUCKS.has(i)) keys.add(`k:${i}:${clamp(Math.round(m), 24, 108)}`);
     else if (BELLS.has(i)) keys.add(`b:${i}:${clamp(Math.round(m), 33, 108)}`);
     else if (i in PERC) keys.add('p:' + i);
     for (const x of EXTRA[i] ?? []) keys.add('p:' + x);
   }
-  const list = [...keys].filter((k) => !bufCache.has(k));
-  if (list.length && workers()) {
-    let done = 0;
+  const recorded = [...keys].filter((k) => k.charCodeAt(0) === 115 && !bufCache.has(k));
+  const list = [...keys].filter((k) => k.charCodeAt(0) !== 115 && !bufCache.has(k));
+  const all = recorded.length + list.length;
+  let got = 0;
+  const tick = () => onProgress?.(++got / Math.max(1, all));
+  const fetched = Promise.all(recorded.map((k) => want(k, urgent).then(tick)));
+  if (!list.length) {
+    await fetched;
+    onProgress?.(1);
+    return;
+  }
+  if (workers()) {
     // reversed so that, when jumping the queue, the list still comes out in its own order
     const order = urgent ? [...list].reverse() : list;
-    await Promise.all(
-      order.map((k) =>
-        want(k, urgent).then(() => {
-          onProgress?.(++done / list.length);
-        }),
-      ),
-    );
+    await Promise.all([fetched, ...order.map((k) => want(k, urgent).then(tick))]);
     return;
   }
   let slice = performance.now();
   for (let k = 0; k < list.length; k++) {
     renderHere(list[k]);
     if (performance.now() - slice > 14) {
-      onProgress?.((k + 1) / list.length);
+      onProgress?.((got + k + 1) / all);
       await new Promise((r) => setTimeout(r, 0));
       slice = performance.now();
     }
   }
+  await fetched;
   onProgress?.(1);
 }
 
@@ -911,7 +1172,7 @@ export interface GraphOpts {
 export const BUS_TRIM: Record<string, number> = { melody: 1.4, pad: 1.5, ost: 1.5, bass: 1, choir: 1.15, brass: 1, drums: 0.5, color: 1.3, fx: 0.75, live: 1.6 };
 const PUMPED = new Set(['pad', 'ost', 'bass', 'melody', 'choir', 'brass', 'color']);
 /** mastering constants (mutable so the lab bench can tune them) */
-export const TUNE = { drive: 0.66, threshold: -18, ratio: 2.2, knee: 12 };
+export const TUNE = { drive: 0.66, threshold: -18, ratio: 2.2, knee: 12, lowTrim: -2, mud: -2, presence: 2, hallHp: 250 };
 const REVERB_RETURN = 1;
 
 export class AudioGraph {
@@ -958,7 +1219,7 @@ export class AudioGraph {
       lfo(hz).connect(g);
       return g;
     };
-    this.lfo = [lfo(5.3), lfo(6.1)];
+    this.lfo = [lfo(5.3), lfo(6.1), lfo(4.7), lfo(5.7), lfo(6.6), lfo(5.0)];
     this.trem = [scaled(11.3, 0.36), scaled(12.9, 0.36), scaled(14.2, 0.36)];
     this.chLfo = [scaled(0.53, 0.0032), scaled(0.81, 0.0038)];
 
@@ -971,10 +1232,14 @@ export class AudioGraph {
       return;
     }
 
-    // mastering: rumble filter → tone tilt → glue compression → soft clip ceiling
+    // mastering: rumble filter → tone tilt → clear the low mids, bring the detail forward → glue compression → soft clip ceiling
     const hp = this.bq('highpass', 26, 0.7);
     const lo = this.bq('lowshelf', 120, 0.7);
-    lo.gain.value = style.tilt.low;
+    lo.gain.value = style.tilt.low + TUNE.lowTrim;
+    const mud = this.bq('peaking', 300, 0.9);
+    mud.gain.value = TUNE.mud;
+    const pres = this.bq('peaking', 3200, 0.8);
+    pres.gain.value = TUNE.presence;
     const hi = this.bq('highshelf', 6500, 0.7);
     hi.gain.value = style.tilt.high;
     const comp = ctx.createDynamicsCompressor();
@@ -989,7 +1254,9 @@ export class AudioGraph {
     clip.oversample = '2x';
     this.sum.connect(hp);
     hp.connect(lo);
-    lo.connect(hi);
+    lo.connect(mud);
+    mud.connect(pres);
+    pres.connect(hi);
     hi.connect(comp);
     comp.connect(pre);
     pre.connect(clip);
@@ -997,7 +1264,8 @@ export class AudioGraph {
 
     // the hall
     this.revIn = this.gn(1);
-    const rhp = this.bq('highpass', 170, 0.5);
+    // a hall full of low mids is mud: the reverb only gets what is above them
+    const rhp = this.bq('highpass', TUNE.hallHp, 0.5);
     const predelay = ctx.createDelay(0.25);
     predelay.delayTime.value = style.reverb.predelay;
     const conv = ctx.createConvolver();
