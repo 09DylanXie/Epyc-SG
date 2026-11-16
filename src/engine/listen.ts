@@ -27,6 +27,8 @@ export interface HeardNote {
 }
 export interface Phrase {
   notes: number[];
+  /** each note's onset (seconds after the first) and length, as played in the recording */
+  rhythm?: [number, number][];
   from: number;
   to: number;
   score: number;
@@ -43,6 +45,8 @@ export interface Heard {
   line: HeardNote[];
   /** how far the recording sits from A440, in semitones */
   tune?: number;
+  /** beats, bars, key and loudness, for playing along with the recording (Amplify) */
+  map?: import('./beat').SongMap | null;
   seconds: number;
 }
 
@@ -54,7 +58,7 @@ const HOP = 320;
 /** longest stretch analysed, in seconds */
 export const MAX_SECONDS = 360;
 
-function fft(re: Float64Array, im: Float64Array) {
+export function fft(re: Float64Array, im: Float64Array) {
   const n = re.length;
   for (let i = 1, j = 0; i < n; i++) {
     let bit = n >> 1;
@@ -441,11 +445,7 @@ export function pickPhrases(line: HeardNote[], want = 6): Phrase[] {
   const clearNotes = line.filter((n) => n.clear >= PHRASE_CLEAR);
   if (clearNotes.length < 2) return [];
   // strict first; a melody full of rests (or a short jingle) gets a looser reading, flagged as such
-  const tiers: Tier[] = [
-    { gap: 0.45, long: 2.5, minN: 4, distinct: 3, range: 3, loose: false },
-    { gap: 1.6, long: 6, minN: 3, distinct: 2, range: 2, loose: true },
-  ];
-  for (const t of tiers) {
+  for (const t of TIERS) {
     const got = pickTier(line, want, t);
     if (got.length) return got;
   }
@@ -463,7 +463,52 @@ export function pickPhrases(line: HeardNote[], want = 6): Phrase[] {
   const run = line.slice(best, best + 8).filter((n) => n.clear >= PHRASE_CLEAR);
   if (run.length < 2) return [];
   const c = run.reduce((a, n) => a + n.conf, 0) / run.length;
-  return [{ notes: run.map((n) => n.midi), from: run[0].t, to: run[run.length - 1].t + run[run.length - 1].d, score: 0, conf: c, loose: true }];
+  return [{ notes: run.map((n) => n.midi), rhythm: rhythmOf(run), from: run[0].t, to: run[run.length - 1].t + run[run.length - 1].d, score: 0, conf: c, loose: true }];
+}
+
+/** a stretch of the song someone asked for, and roughly how many notes they want from it */
+export interface Window {
+  from: number;
+  to: number;
+  size?: number;
+  /** at least / at most this many notes */
+  min?: number;
+  max?: number;
+}
+
+const TIERS: Tier[] = [
+  { gap: 0.45, long: 2.5, minN: 4, distinct: 3, range: 3, loose: false },
+  { gap: 1.6, long: 6, minN: 3, distinct: 2, range: 2, loose: true },
+];
+
+/**
+ * The best phrase inside a stretch someone chose. The song-wide statistics (typical note length,
+ * the song's own pitches, repeats) still come from the whole line. An explicit request is honoured
+ * even when nothing passes the usual gates: the clearest notes there, flagged as a guess.
+ */
+export function pickInWindow(line: HeardNote[], w: Window): Phrase | null {
+  for (const t of TIERS) {
+    const got = pickTier(line, 1, t, w);
+    if (got.length) return got[0];
+  }
+  // by where notes start, like the phrase search; the last one may ring past the end
+  const inside = line.filter((n) => n.t >= w.from - 0.3 && n.t < w.to);
+  const max = w.max ?? Math.max(3, Math.min(12, Math.max(w.size ?? 8, w.min ?? 0)));
+  const clear = inside.filter((n) => n.clear >= MIN_CLEAR);
+  const pool = clear.length >= 2 ? clear : inside;
+  if (pool.length < 2) return null;
+  let best = 0;
+  let bestScore = -Infinity;
+  for (let i = 0; i + Math.min(max, pool.length) <= pool.length; i++) {
+    const s = pool.slice(i, i + max).reduce((a, n) => a + Math.min(n.clear, 8), 0);
+    if (s > bestScore) {
+      bestScore = s;
+      best = i;
+    }
+  }
+  const run = pool.slice(best, best + max);
+  const c = run.reduce((a, n) => a + n.conf, 0) / run.length;
+  return { notes: run.map((n) => n.midi), rhythm: rhythmOf(run), from: run[0].t, to: run[run.length - 1].t + run[run.length - 1].d, score: 0, conf: c, loose: true };
 }
 
 interface Tier {
@@ -477,7 +522,7 @@ interface Tier {
   loose: boolean;
 }
 
-function pickTier(line: HeardNote[], want: number, T: Tier): Phrase[] {
+function pickTier(line: HeardNote[], want: number, T: Tier, win?: Window): Phrase[] {
   if (line.length < T.minN) return [];
   const durs = line.map((n) => n.d).sort((a, b) => a - b);
   const md = durs[Math.floor(durs.length / 2)];
@@ -513,7 +558,8 @@ function pickTier(line: HeardNote[], want: number, T: Tier): Phrase[] {
 
   const cands: Phrase[] = [];
   for (let i = 0; i < line.length; i++) {
-    for (let n = T.minN; n <= 12 && i + n <= line.length; n++) {
+    if (win && (line[i].t < win.from - 0.3 || line[i].t >= win.to)) continue;
+    for (let n = Math.max(T.minN, win?.min ?? 0); n <= Math.min(12, win?.max ?? 12) && i + n <= line.length; n++) {
       let broken = false;
       for (let k = i + 1; k < i + n; k++) if (breaks.has(k)) broken = true;
       if (broken) break;
@@ -521,6 +567,7 @@ function pickTier(line: HeardNote[], want: number, T: Tier): Phrase[] {
       const from = notes[0].t;
       const to = notes[n - 1].t + notes[n - 1].d;
       if (to - from > (T.loose ? 14 : 9)) break;
+      if (win && to > win.to + 0.3) break;
       const midis = notes.map((x) => x.midi);
       const distinct = new Set(midis.map((m) => m % 12)).size;
       const range = Math.max(...midis) - Math.min(...midis);
@@ -541,9 +588,9 @@ function pickTier(line: HeardNote[], want: number, T: Tier): Phrase[] {
       // a complete thought: a phrase that ends right before a rest or a long note is better than one cut mid-flow
       const ends = i + n >= line.length || breaks.has(i + n) || notes[n - 1].d > 1.8 * md;
       const starts = i === 0 || breaks.has(i) || line[i - 1].d > 1.8 * md;
-      const sizeFit = 1 - Math.abs(n - 7) / 8;
+      const sizeFit = 1 - Math.abs(n - (win?.size ?? 7)) / 8;
       const score = conf * 1.2 + Math.log1p(repeats) * 0.55 + (ends ? 0.35 : 0) + (starts ? 0.35 : 0) + sizeFit * 0.4 + Math.min(distinct, 5) * 0.06 - leaps * 0.35 - (still / n) * 0.6 - odd * 0.5;
-      cands.push({ notes: midis, from, to, score, conf, repeats, loose: T.loose || undefined });
+      cands.push({ notes: midis, rhythm: rhythmOf(notes), from, to, score, conf, repeats, loose: T.loose || undefined });
     }
   }
   cands.sort((a, b) => b.score - a.score);
@@ -560,6 +607,12 @@ function pickTier(line: HeardNote[], want: number, T: Tier): Phrase[] {
     if (out.length >= want) break;
   }
   return out;
+}
+
+/** onsets relative to the first note, and lengths, in seconds (rounded to the millisecond) */
+export function rhythmOf(notes: { t: number; d: number }[]): [number, number][] {
+  const t0 = notes[0]?.t ?? 0;
+  return notes.map((n) => [Math.round((n.t - t0) * 1000) / 1000, Math.round(n.d * 1000) / 1000]);
 }
 
 /** bring a phrase into a comfortable range for the pads and the composer, as a whole */

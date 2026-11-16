@@ -21,8 +21,31 @@ export interface RenderOpts {
   noNormalize?: boolean;
   /** bypass hall and mastering (calibration only) */
   dry?: boolean;
+  /** Amplify: the recording, mixed in untouched, and how loud the layer sits against it */
+  song?: { buf: AudioBuffer; gain: number; layer: number; from?: number };
   /** diagnostics: wall-clock milliseconds it took to perform the `span` seconds ending at `t` */
   onChunk?: (t: number, wallMs: number, span: number) => void;
+}
+
+/** seconds after a part's last beat for the hall and the last notes to ring out */
+export const PART_TAIL = 2.5;
+
+/**
+ * One part of a piece as a piece of its own: the notes that start inside [from, to) beats, moved
+ * to the top, with a short tail so the last chord rings into the hall instead of being cut.
+ */
+export function sliceScore(sc: Score, from: number, to: number): Score {
+  const spb = 60 / sc.bpm;
+  const beats = Math.max(0, to - from);
+  const events = sc.events.filter((e) => e.t >= from - 0.03 && e.t < to - 0.01).map((e) => ({ ...e, t: Math.max(0, e.t - from) }));
+  const durationSec = beats * spb + PART_TAIL;
+  return {
+    ...sc,
+    events,
+    durationSec,
+    totalBeats: beats,
+    song: sc.song ? { ...sc.song, seconds: Math.max(0, Math.min(sc.song.seconds - from * spb, durationSec)) } : sc.song,
+  };
 }
 
 /** silence before the first note, so nothing starts on sample zero */
@@ -39,7 +62,23 @@ export async function renderScore(score: Score, style: StylePreset, opts: Render
   const seconds = score.durationSec + LEAD_IN;
   const off = new OfflineAudioContext(2, Math.ceil(seconds * sr), sr);
   await prepareSamples(score.events, (p) => opts.onProgress?.(p, 'samples'));
-  const graph = new AudioGraph(off, off.destination, style, score.bpm, { levels: opts.levels, raw: opts.dry });
+  // the recording goes straight to the output: no hall, no tone shaping, no compression
+  let dest: AudioNode = off.destination;
+  if (opts.song && score.song) {
+    const layer = off.createGain();
+    layer.gain.value = opts.song.layer;
+    layer.connect(off.destination);
+    dest = layer;
+    const g = off.createGain();
+    g.gain.value = opts.song.gain;
+    g.connect(off.destination);
+    const src = off.createBufferSource();
+    src.buffer = opts.song.buf;
+    src.connect(g);
+    const from = opts.song.from ?? 0;
+    src.start(LEAD_IN, from, Math.max(0, Math.min(opts.song.buf.duration - from, score.song.seconds)));
+  }
+  const graph = new AudioGraph(off, dest, style, score.bpm, { levels: opts.levels, raw: opts.dry });
   const spb = 60 / score.bpm;
   const evs = score.events;
   let idx = 0;

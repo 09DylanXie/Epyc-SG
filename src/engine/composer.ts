@@ -7,6 +7,7 @@
  * Pure and deterministic. The same event list drives live playback and the offline MP3 render.
  */
 import { makeRng, type Rng } from './rng';
+import { fitLength } from './fit';
 import {
   MODES, PROGS, PC_NAMES, parseProg, parseRoman, chordPcs, chordLabel, chordIntervals, prettyRoman,
   degToMidi, midiToDeg, detectKey, voiceChord, chordStack, nearestPc, pcOf, triadOf,
@@ -85,9 +86,13 @@ export function compose(input: ComposeInput): Score {
   if (input.origin) {
     const mmss = (x: number) => `${Math.floor(x / 60)}:${String(Math.floor(x % 60)).padStart(2, '0')}`;
     const span = mmss(input.origin.from) === mmss(input.origin.to) ? `at ${mmss(input.origin.from)}` : `between ${mmss(input.origin.from)} and ${mmss(input.origin.to)}`;
-    insights.push({
+    if (input.origin.own) insights.push({
       title: `Melody · from ${input.origin.name}`,
-      body: `I listened to your recording and followed its lead line. ${input.origin.loose ? `The melody was hard to make out, so these ${played.length} notes, ${span}, are my best guess at it.` : `The clearest phrase${input.origin.repeats ? ', one whose shape keeps coming back,' : ''} was ${span} — ${played.length} notes.`} Only those notes were kept; everything below is written new around them.`,
+      body: `These ${played.length} notes are the lead line of that part of your piece, ${span}, with their rhythm kept. Everything below is written new around them.`,
+    });
+    else insights.push({
+      title: `Melody · from ${input.origin.name}`,
+      body: `I listened to your recording and followed its lead line. ${input.origin.asked ? `You asked for a melody from a particular stretch, so I took the ${input.origin.loose ? 'clearest ' : ''}${played.length} notes ${span}${input.origin.loose ? ' — it was hard to make out there, so treat it as a best guess' : ''}.` : input.origin.loose ? `The melody was hard to make out, so these ${played.length} notes, ${span}, are my best guess at it.` : `The clearest phrase${input.origin.repeats ? ', one whose shape keeps coming back,' : ''} was ${span} — ${played.length} notes.`} Only those notes were kept; everything below is written new around them.`,
     });
   }
 
@@ -142,7 +147,23 @@ export function compose(input: ComposeInput): Score {
     }
   }
 
-  const bpm = clamp(Math.round(input.tempo ?? rng.fork('tempo').range(style.tempo[0], style.tempo[1])), 40, 220);
+  // the recording's own timing, when the notes came from one (and haven't been changed since)
+  const heardRh = input.origin?.rhythm && input.origin.rhythm.length === played.length && played.length >= 2 ? input.origin.rhythm : null;
+  // at the song's own tempo when it's known: by octaves into this mode's range, so a 140 BPM song in a
+  // slow mode is felt in half time rather than played at 140
+  let songBpm: number | null = null;
+  if (heardRh && input.origin?.bpm && !input.tempo) {
+    const [lo, hi] = style.tempo;
+    // the longest stretch from a first note to a last onset, in seconds (both halves of a long motif)
+    const lastOn = Math.max(...[heardRh.slice(0, dA.length), dB ? heardRh.slice(dA.length) : []].filter((r) => r.length).map((r) => r[r.length - 1][0] - r[0][0]));
+    const fits = (b: number) => lastOn <= (SPAN - 1.5) / ((b / 60) * 2);
+    const cands: number[] = [];
+    for (let b = input.origin.bpm / 8; b <= 260; b *= 2) if (b >= Math.max(40, lo / 1.5) && b <= hi * 1.5) cands.push(b);
+    // the fastest octave of the song's tempo that leaves the phrase untouched; failing that, the slowest
+    const ok = cands.filter(fits);
+    songBpm = ok.length ? ok[ok.length - 1] : cands[0] ?? null;
+  }
+  const bpm = clamp(Math.round(input.tempo ?? songBpm ?? rng.fork('tempo').range(style.tempo[0], style.tempo[1])), 40, 220);
 
   // ── 4. rhythm ───────────────────────────────────────────────────
   const weightAt = (slot: number) => meter.weights[((Math.round(slot) % E) + E) % E];
@@ -186,13 +207,40 @@ export function compose(input: ComposeInput): Score {
     return rh.map((x, i) => ({ ...x, deg: ds[Math.min(i, ds.length - 1)], raw: true, hc: hc0 + Math.min(1, Math.floor(x.pos / E)) }));
   };
 
-  const P1 = toPhrase(dA, rng.fork('rhythmA'), 0);
-  const userB = dB ? toPhrase(dB, rng.fork('rhythmB'), 2) : null;
+  // the heard rhythm, note for note: every onset and length kept in proportion, in eighth-note
+  // slots at this tempo (not snapped to a grid). Only if the phrase is longer than its two bars is
+  // it squeezed, evenly, so the time between the notes stays in the same ratios
+  let squeeze = 1;
+  const fromHeard = (ds: number[], rh: [number, number][], hc0: number): Phrase => {
+    const sps = (bpm / 60) * 2;
+    const t0 = rh[0][0];
+    let pos = rh.map(([t]) => (t - t0) * sps);
+    const lastOn = pos[pos.length - 1];
+    const room = SPAN - 1.5;
+    const k = lastOn > room ? room / lastOn : 1;
+    squeeze = Math.min(squeeze, k);
+    pos = pos.map((p) => p * k);
+    return ds.map((deg, i) => {
+      const gap = i < ds.length - 1 ? pos[i + 1] - pos[i] : SPAN - pos[i];
+      const len = Math.max(0.25, Math.min(gap, rh[i][1] * sps * k));
+      return { pos: pos[i], len: i === ds.length - 1 ? Math.max(1, len) : len, deg, raw: true, hc: hc0 + Math.min(1, Math.floor(pos[i] / E)) };
+    });
+  };
+  const rhA = heardRh ? heardRh.slice(0, dA.length) : null;
+  const rhB = heardRh && dB ? heardRh.slice(dA.length) : null;
+  const P1 = rhA && rhA.length === dA.length ? fromHeard(dA, rhA, 0) : toPhrase(dA, rng.fork('rhythmA'), 0);
+  const userB = dB ? (rhB && rhB.length === dB.length ? fromHeard(dB, rhB, 2) : toPhrase(dB, rng.fork('rhythmB'), 2)) : null;
+  const heardFeel = !!(rhA && rhA.length === dA.length);
 
   insights.push({
     title: `Rhythm · ${meter.label} at ${bpm} BPM`,
-    body:
-      givenCount < 3
+    body: heardFeel
+      ? input.origin!.own
+        ? `The notes keep their own timing from ${input.origin!.name}: each starts and rings where it did there${songBpm ? `, at that piece's tempo (${Math.round(songBpm)} BPM)` : ''}.${squeeze < 0.98 ? ` The phrase ran longer than two bars, so it plays ${Math.round((1 / squeeze - 1) * 100)}% faster, evenly.` : ''}`
+        : squeeze < 0.98
+        ? `The notes keep the recording's own timing, nothing snapped to a grid${songBpm ? `, at the song's tempo (${Math.round(songBpm)} BPM)` : ''}. The phrase ran longer than two bars, so it plays ${Math.round((1 / squeeze - 1) * 100)}% faster, evenly: the gaps between the notes keep their proportions.`
+        : `The notes keep the recording's own timing: each note starts and rings where I heard it in ${input.origin!.name}, nothing snapped to a grid${songBpm ? `, at the song's own tempo (${Math.round(songBpm)} BPM)` : ''}.`
+      : givenCount < 3
         ? `You gave me ${givenCount === 1 ? 'a single note' : 'two notes'}, so I answered with a few of my own, then spread the phrase over two bars — the last note lands on a downbeat and rings.`
         : two
           ? `Sixteen notes is two ideas: your first ${dA.length} notes became the call, the remaining ${dB!.length} the response — two bars each.`
@@ -342,7 +390,6 @@ export function compose(input: ComposeInput): Score {
   // ── 7. sections ─────────────────────────────────────────────────
   // build-up & drop: every big arrival gets a run-up that accelerates, a riser, one beat of
   // silence, and then lands with an impact and a sub drop
-  const dropSpecs = new Set<SectionSpec>();
   const withDrops = (src: SectionSpec[]): SectionSpec[] => {
     const out = src.map((x) => ({ ...x, layers: [...x.layers] }));
     const S = meter.steps;
@@ -357,6 +404,8 @@ export function compose(input: ComposeInput): Score {
       return p;
     };
     const runUp = (bars: number): DrumLayer => ({ k: 'drums', g: { [snare]: accel(bars) }, vel: 0.62, cresc: [0.35, 1.15] });
+    // a slow piece that has to fit in forty seconds gets a two-bar run-up
+    const ub = input.length === 'short' && ((meter.beats * 60) / bpm) * 4 > 10 ? 2 : 4;
     let landed = 0;
     const isBig = (x: SectionSpec) => x.kind === 'climax' || (x.kind === 'finale' && x.energy >= 0.9);
     // a style with no marked climax (lo-fi, ambient) drops into its loudest section instead
@@ -378,9 +427,9 @@ export function compose(input: ComposeInput): Score {
         for (const l of target.layers) {
           if (l.k === 'pad' || l.k === 'ost' || l.k === 'bass') layers.push({ ...l, from: undefined, to: undefined, every: undefined, vel: (l.vel ?? 0.6) * 0.85, cresc: [0.3, 1.1] });
         }
-        layers.push(runUp(4));
+        layers.push(runUp(ub));
         out.splice(i, 0, {
-          name: 'Build-Up', kind: 'build', bars: 4, energy: Math.max(0.6, Math.min(0.75, prev.energy + 0.2)), lift, layers,
+          name: 'Build-Up', kind: 'build', bars: ub, energy: Math.max(0.6, Math.min(0.75, prev.energy + 0.2)), lift, layers,
           exit: ['riser', 'roll', 'cut'],
           say: 'The build-up: the drums speed up bar by bar, everything climbs, then one beat of silence.',
         });
@@ -396,7 +445,7 @@ export function compose(input: ComposeInput): Score {
         target.layers.push({ k: 'drums', g: { boom, taikoLo: taiko }, vel: style.fx.big.length ? 0.72 : 0.55 });
       }
       target.say = `${target.say ?? ''} The drop: it all lands at once.`.trim();
-      dropSpecs.add(target);
+      target.drop = true;
     }
     if (landed) {
       insights.push({
@@ -406,7 +455,8 @@ export function compose(input: ComposeInput): Score {
     }
     return out;
   };
-  const specs = input.drop ? withDrops(style.form(input.length)) : style.form(input.length);
+  // fitted after the drops, so a build-up counts toward the running time like any other section
+  const specs = fitLength(input.drop ? withDrops(style.form(input.length)) : style.form(input.length), input.length, (meter.beats * 60) / bpm, style.reverb.size * 0.9 + 1.5);
   interface SecCtx extends Section {
     chordsByBar: Chord[];
     tonicPc: number;
@@ -831,7 +881,7 @@ export function compose(input: ComposeInput): Score {
 
   function enterFx(kind: EnterFx, sec: SecCtx, si: number) {
     let list: readonly (readonly [Inst, number])[] = kind === 'big' ? fx.big : kind === 'hit' ? fx.hit : kind === 'drop' ? fx.drop : [];
-    if (dropSpecs.has(sec.spec)) {
+    if (sec.spec.drop) {
       // a drop always lands with weight, even in a style that usually arrives gently
       const add: [Inst, number][] = [['impact', 0.85], ['subDrop', 0.75], ['crash', 0.4]];
       list = [...list, ...add.filter(([i]) => !list.some(([j]) => j === i))];

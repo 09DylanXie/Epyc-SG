@@ -27,7 +27,7 @@ function Contour({ strand, lo, hi, strong }: { strand: DnaStrand; lo: number; hi
 function Dna({ score }: { score: Score }) {
   const [lo, hi] = useMemo(() => {
     const all = score.dna.flatMap((s) => s.notes.map((n) => n.deg));
-    return [Math.min(...all), Math.max(...all)];
+    return all.length ? [Math.min(...all), Math.max(...all)] : [0, 1];
   }, [score]);
   return (
     <div className="card overflow-hidden">
@@ -146,9 +146,75 @@ function Mixer() {
   );
 }
 
+/** the conversation about an imported song: which part of it the melody should come from */
+function Talk() {
+  const chat = useStudio((s) => s.chat);
+  const end = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    end.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  }, [chat.length]);
+  return (
+    <section data-testid="talk">
+      <div className="eyebrow mb-2 px-1">Talk to the composer</div>
+      <div className="space-y-2" aria-live="polite">
+        {chat.map((m, i) => (
+          <div key={i} className={m.who === 'you' ? 'talk-you' : 'talk-me'}>
+            {m.text}
+          </div>
+        ))}
+        <div ref={end} />
+      </div>
+    </section>
+  );
+}
+
+const ASKS = ['Later', 'Earlier', 'Longer', 'Shorter', 'List'];
+
+function Ask() {
+  const busy = useStudio((s) => s.phase === 'forging' || !!s.importing);
+  const [text, setText] = useState('');
+  const send = (t: string) => {
+    if (!t.trim() || busy) return;
+    useStudio.getState().tell(t);
+    setText('');
+  };
+  return (
+    <form
+      className="border-t border-white/[0.06] px-4 pt-2.5 pb-4"
+      onSubmit={(e) => {
+        e.preventDefault();
+        send(text);
+      }}
+    >
+      <div className="mb-2 flex flex-wrap gap-1.5">
+        {ASKS.map((a) => (
+          <button key={a} type="button" className="chip hover:text-ink disabled:opacity-40" disabled={busy} onClick={() => send(a.toLowerCase())}>
+            {a}
+          </button>
+        ))}
+      </div>
+      <div className="flex gap-2">
+        <input
+          className="talk-input"
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          placeholder="e.g. use 1:20 to 1:35"
+          aria-label="Tell the composer which part of the song to use"
+          maxLength={200}
+          data-testid="talk-input"
+        />
+        <button className="btn" type="submit" disabled={busy || !text.trim()}>
+          {busy ? '…' : 'Send'}
+        </button>
+      </div>
+    </form>
+  );
+}
+
 /** right rail: the reasoning behind the piece, and the mixing desk */
 export default function Mind() {
   const score = useStudio((s) => s.score);
+  const heard = useStudio((s) => !!s.heard);
   const [tab, setTab] = useState<'mind' | 'mixer'>('mind');
   return (
     <aside className="rail rail-r glass">
@@ -176,14 +242,18 @@ export default function Mind() {
           <Empty />
         ) : (
           <>
-            <section>
-              <div className="eyebrow mb-2 px-1">Motif DNA</div>
-              <Dna score={score} />
-            </section>
-            <section>
-              <div className="eyebrow mb-2 px-1">Harmony · now</div>
-              <Harmony score={score} />
-            </section>
+            {score.song ? null : (
+              <>
+                <section>
+                  <div className="eyebrow mb-2 px-1">Motif DNA</div>
+                  <Dna score={score} />
+                </section>
+                <section>
+                  <div className="eyebrow mb-2 px-1">Harmony · now</div>
+                  <Harmony score={score} />
+                </section>
+              </>
+            )}
             <section>
               <div className="eyebrow mb-2 px-1">Decisions</div>
               <div className="space-y-2">
@@ -195,9 +265,11 @@ export default function Mind() {
                 ))}
               </div>
             </section>
+            {heard && <Talk />}
           </>
         )}
       </div>
+      {tab === 'mind' && heard && <Ask />}
     </aside>
   );
 }

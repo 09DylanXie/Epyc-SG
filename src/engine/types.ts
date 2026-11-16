@@ -171,6 +171,8 @@ export interface Score {
   baseTonic: number;
   progression: string;
   origin?: Origin | null;
+  /** Amplify: the imported recording plays under this score, untouched */
+  song?: { name: string; seconds: number; rms: number } | null;
 }
 
 // ───────────────────────────── style presets ─────────────────────────────
@@ -263,6 +265,8 @@ export interface SectionSpec {
   enter?: EnterFx;
   exit?: ExitFx[];
   say?: string;
+  /** Build & Drop lands here: impact and sub drop on the downbeat */
+  drop?: boolean;
 }
 
 export type Hit = readonly [Inst, number];
@@ -337,6 +341,14 @@ export interface Origin {
   repeats?: number;
   /** the melody was hard to make out, so this is a best guess */
   loose?: boolean;
+  /** the person chose this stretch of the recording themselves */
+  asked?: boolean;
+  /** each note's onset (seconds after the first) and length, exactly as played in the recording */
+  rhythm?: [number, number][];
+  /** the recording's tempo, so the melody can keep its own speed */
+  bpm?: number;
+  /** taken from a part of one of your own pieces (right-click on the timeline), not a recording */
+  own?: boolean;
 }
 
 export type { Chord };

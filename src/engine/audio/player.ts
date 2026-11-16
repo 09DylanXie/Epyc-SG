@@ -6,7 +6,7 @@ import { STYLES } from '../styles';
 import { BUSES, type Bus, type Inst, type Score, type StylePreset } from '../types';
 import { encodeMp3, saveBlob, wavBlob } from './encode';
 import { AudioGraph, isSustained, prepareHall, prepareSamples, type Voice } from './graph';
-import { renderScore } from './render';
+import { renderScore, sliceScore } from './render';
 
 export type PlayerEvent = 'state' | 'section' | 'chord' | 'end';
 
@@ -20,6 +20,15 @@ export interface Comet {
 }
 
 const TICK_MS = 40;
+
+/** Amplify: the recording leaves headroom for the layer; the layer is set relative to how loud the song is */
+export const SONG_GAIN = 0.6;
+/** typical RMS of the layer as the mastering chain delivers it (calibrated against renders) */
+export const LAYER_REF_RMS = 0.06;
+export function layerGain(songRms: number): number {
+  // about 7 dB under the song, whatever its level
+  return SONG_GAIN * Math.max(0.12, Math.min(2.5, (songRms / LAYER_REF_RMS) * Math.pow(10, -7 / 20)));
+}
 const LOOKAHEAD = 0.28;
 const START_DELAY = 0.09;
 
@@ -49,6 +58,12 @@ class Player {
   sounding = new Set<number>();
 
   private out: GainNode | null = null;
+  /** the layer (everything the graph plays) on its way out; in Amplify it goes through its own limiter */
+  private layer: GainNode | null = null;
+  private songIn: GainNode | null = null;
+  private limiter: DynamicsCompressorNode | null = null;
+  private songBuf: AudioBuffer | null = null;
+  private songSrc: AudioBufferSourceNode | null = null;
   private t0 = 0;
   private spb = 0.5;
   private idx = 0;
@@ -84,6 +99,20 @@ class Player {
       this.analyser.maxDecibels = -16;
       this.out.connect(ctx.destination);
       this.out.connect(this.analyser);
+      this.layer = ctx.createGain();
+      this.layer.connect(this.out);
+      this.songIn = ctx.createGain();
+      this.songIn.gain.value = SONG_GAIN;
+      // the song goes straight out with nothing in its path; only the layer is limited, low enough
+      // (−8 dBFS) that the two can't clip together over the song's 0.6 (−4.4 dBFS)
+      this.limiter = ctx.createDynamicsCompressor();
+      this.limiter.threshold.value = -8;
+      this.limiter.knee.value = 0;
+      this.limiter.ratio.value = 20;
+      this.limiter.attack.value = 0.002;
+      this.limiter.release.value = 0.2;
+      this.songIn.connect(this.out);
+      this.limiter.connect(this.out);
       this.buildGraph();
       const src = `let id=null;onmessage=e=>{if(e.data==='start'){if(id===null)id=setInterval(()=>postMessage(0),${TICK_MS})}else{clearInterval(id);id=null}}`;
       this.timer = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
@@ -101,7 +130,38 @@ class Player {
     if (!this.ctx || !this.out) return;
     this.held.clear();
     this.graph?.dispose();
-    this.graph = new AudioGraph(this.ctx, this.out, this.style, this.score?.bpm ?? 110, { live: true, levels: this.effective() });
+    this.graph = new AudioGraph(this.ctx, this.layer ?? this.out, this.style, this.score?.bpm ?? 110, { live: true, levels: this.effective() });
+  }
+
+  /** the recording Amplify plays under its layer (the last one imported) */
+  setSong(buf: AudioBuffer | null) {
+    if (buf === this.songBuf) return;
+    this.stopSong();
+    this.songBuf = buf;
+  }
+
+  get hasSong(): boolean {
+    return !!this.songBuf;
+  }
+
+  private stopSong() {
+    try {
+      this.songSrc?.stop();
+    } catch {
+      /* never started */
+    }
+    this.songSrc?.disconnect();
+    this.songSrc = null;
+  }
+
+  /** route the layer straight out, or (under a song) through its own limiter */
+  private route() {
+    const { layer, limiter, out } = this;
+    if (!layer || !limiter || !out) return;
+    const song = this.score?.song;
+    layer.disconnect();
+    layer.connect(song ? limiter : out);
+    layer.gain.value = song ? layerGain(song.rms) : 1;
   }
 
   /** change world; the pads take on its voice immediately */
@@ -123,6 +183,7 @@ class Player {
     } else this.graph.setTempo(score.bpm);
     this.sectionIdx = -1;
     this.chordIdx = -1;
+    this.route();
     await prepareSamples(score.events, onProgress);
   }
 
@@ -151,6 +212,17 @@ class Player {
     graph.stopAll();
     const start = ctx.currentTime + START_DELAY;
     this.t0 = start - from * this.spb;
+    this.stopSong();
+    if (score.song && this.songBuf && this.songIn) {
+      const at = from * this.spb;
+      if (at < Math.min(this.songBuf.duration, score.song.seconds)) {
+        const src = ctx.createBufferSource();
+        src.buffer = this.songBuf;
+        src.connect(this.songIn);
+        src.start(start, at, score.song.seconds - at);
+        this.songSrc = src;
+      }
+    }
     const evs = score.events;
     let lo = 0;
     let hi = evs.length;
@@ -185,6 +257,7 @@ class Player {
     this.playing = false;
     this.timer?.postMessage('stop');
     this.graph?.stopAll();
+    this.stopSong();
     this.sounding.clear();
     this.emit('state');
   }
@@ -195,6 +268,7 @@ class Player {
     this.pausedAt = 0;
     this.timer?.postMessage('stop');
     this.graph?.stopAll();
+    this.stopSong();
     this.sounding.clear();
     if (was) this.emit('state');
   }
@@ -369,15 +443,24 @@ class Player {
   // ── export ──
 
   /** renders the current piece offline (with your mixer settings) and downloads it */
-  async download(format: 'mp3' | 'wav', onProgress: (p: number, label: string) => void): Promise<{ bytes: number; seconds: number; name: string }> {
-    const score = this.score;
-    if (!score) throw new Error('Nothing to export yet');
+  async download(
+    format: 'mp3' | 'wav',
+    onProgress: (p: number, label: string) => void,
+    part?: { from: number; to: number; name: string },
+  ): Promise<{ bytes: number; seconds: number; name: string }> {
+    const whole = this.score;
+    if (!whole) throw new Error('Nothing to export yet');
+    // one part only: its notes (and, under Amplify, that stretch of the recording)
+    const score = part ? sliceScore(whole, part.from, part.to) : whole;
+    const songFrom = part ? (part.from * 60) / whole.bpm : 0;
     const t0 = performance.now();
+    if (score.song && !this.songBuf) throw new Error('Import the song again to export it — the recording is only kept until the page reloads.');
     const res = await renderScore(score, this.style, {
       levels: this.effective(),
+      song: score.song && this.songBuf ? { buf: this.songBuf, gain: SONG_GAIN, layer: layerGain(score.song.rms), from: songFrom } : undefined,
       onProgress: (p, stage) => onProgress(stage === 'samples' ? p * 0.08 : 0.08 + p * 0.62, stage === 'samples' ? 'Tuning the orchestra' : 'Performing the piece'),
     });
-    const name = `${score.title} — Epyc SG`.replace(/[\\/:*?"<>|]/g, '').trim();
+    const name = `${score.title}${part ? ` (${part.name})` : ''} — Epyc SG`.replace(/[\\/:*?"<>|]/g, '').trim();
     const t1 = performance.now();
     let blob: Blob;
     if (format === 'mp3') {
@@ -389,13 +472,14 @@ class Player {
     onProgress(1, 'Done');
     exportTiming.render = t1 - t0;
     exportTiming.encode = performance.now() - t1;
+    exportTiming.peak = res.rawPeak;
     saveBlob(blob, `${name}.${format}`);
     return { bytes: blob.size, seconds: res.seconds, name: `${name}.${format}` };
   }
 }
 
 /** how long the last export spent performing and encoding, in ms (diagnostics) */
-export const exportTiming = { render: 0, encode: 0 };
+export const exportTiming = { render: 0, encode: 0, peak: 0 };
 
 export const player = new Player();
 export type { Player };

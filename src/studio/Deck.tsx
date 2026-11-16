@@ -1,5 +1,6 @@
 'use client';
 
+import { AMPLIFY_ID } from '@/engine/backing';
 import { useEffect, useRef, type CSSProperties, type PointerEvent as RPointerEvent } from 'react';
 import { player } from '@/engine/audio/player';
 import { STYLES } from '@/engine/styles';
@@ -75,6 +76,7 @@ function Tray() {
   const importing = useStudio((s) => s.importing);
   const heard = useStudio((s) => s.heard);
   const origin = useStudio((s) => s.origin);
+  const amp = useStudio((s) => s.styleId === AMPLIFY_ID);
   const { undo, newMotif, setCapture, previewMotif, forge, inspireMe, importFile, nextPhrase } = useStudio.getState();
   const fileRef = useRef<HTMLInputElement>(null);
   const lo = motif.length ? Math.min(...motif) : 0;
@@ -108,7 +110,15 @@ function Tray() {
         ))}
         {!motif.length && !importing && (
           <span className="truncate px-2 text-[12.5px] font-medium text-faint">
+            {amp ? (
+              <>
+                <b className="text-dim">Import</b> a song: Amplify plays it exactly as it is and lays drums, a low drone and impacts under it.
+              </>
+            ) : (
+              <>
             Your motif appears here — play 3 to 8 notes, let <b className="text-dim">Inspire</b> start one, or <b className="text-dim">Import</b> a song and I&apos;ll take its melody.
+              </>
+            )}
           </span>
         )}
         {importing && (
@@ -153,7 +163,7 @@ function Tray() {
           if (file) void importFile(file);
         }}
       />
-      {heard && origin && heard.phrases.length > 1 ? (
+      {!amp && heard && origin && heard.phrases.length > 1 ? (
         <button className="btn h-12 flex-col !gap-0.5 px-3" onClick={nextPhrase} disabled={busy || !!importing} data-testid="next-phrase" title={`Use another melody heard in ${heard.name}`}>
           <span className="text-[11.5px]">Another phrase</span>
           <span className="font-mono text-[9.5px] font-medium text-faint">
@@ -166,12 +176,16 @@ function Tray() {
         onClick={() => fileRef.current?.click()}
         disabled={busy || !!importing}
         data-testid="import"
-        title="Import an MP3 (or WAV, M4A, OGG): I take its melody and write a new piece around it in this mode. The file stays on your device. Use recordings whose melody you have the rights to."
+        title={
+          amp
+            ? 'Import an MP3 (or WAV, M4A, OGG): it plays exactly as it is, with an epic layer under it. The file stays on your device.'
+            : 'Import an MP3 (or WAV, M4A, OGG): I take its melody and write a new piece around it in this mode. The file stays on your device. Use recordings whose melody you have the rights to.'
+        }
       >
         <Listen size={16} style={{ color: 'var(--a1)' }} />
         Import
       </button>
-      <button className="btn h-12 px-3.5" onClick={inspireMe} disabled={busy || !!importing} title="Write a motif for me">
+      <button className="btn h-12 px-3.5" onClick={inspireMe} disabled={busy || !!importing || amp} title={amp ? 'Amplify plays your song instead of a motif' : 'Write a motif for me'}>
         <Spark size={15} style={{ color: 'var(--a1)' }} />
         Inspire
       </button>
@@ -196,6 +210,7 @@ function Controls() {
   const length = useStudio((s) => s.length);
   const intensity = useStudio((s) => s.intensity);
   const drop = useStudio((s) => s.drop);
+  const amp = useStudio((s) => s.styleId === AMPLIFY_ID);
   const voice = useStudio((s) => {
     const st = STYLES[s.styleId];
     return st.padLow ? `${INST_LABEL[st.padVoice]} · low notes ${INST_LABEL[st.padLow.inst]}` : INST_LABEL[st.padVoice];
@@ -242,9 +257,9 @@ function Controls() {
 
       <span className="flex-1" />
 
-      <div className="seg-ctl" title="How long the piece runs">
+      <div className="seg-ctl" title={amp ? 'Amplify runs as long as your song' : 'How long the piece runs'}>
         {LENGTHS.map(([id, label]) => (
-          <button key={id} className={length === id ? 'on' : ''} onClick={() => setLength(id)}>
+          <button key={id} className={length === id && !amp ? 'on' : ''} onClick={() => setLength(id)} disabled={amp}>
             {label}
           </button>
         ))}
@@ -253,6 +268,7 @@ function Controls() {
         className={`btn ${drop ? 'on' : ''}`}
         onClick={() => setDrop(!drop)}
         aria-pressed={drop}
+        disabled={amp}
         data-drop
         title={drop ? 'Build-up & drop on: every big moment gets a run-up, a beat of silence and a drop' : 'Add a build-up and a drop before the big moments of your piece'}
       >

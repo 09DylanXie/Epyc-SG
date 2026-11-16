@@ -2091,5 +2091,166 @@ const darkcello: StylePreset = {
   },
 };
 
-export const STYLE_LIST: StylePreset[] = [titan, eldritch, requiem, choirs, darkcello, valor, baile, hellforge, column, carousel, ashen, cataclysm, silk, neon, pulse, phantom, breakneck, tape, aether];
+// ═════════════════════════════ FALLEN GOD — final boss, death & despair ═════════════════════════════
+// A last battle against something that was once holy: a lone voice over tolling booms, then a choir in
+// full wrath over racing strings, braams and a death-blow on every bar; a broken lament; a final phase.
+const fallen: StylePreset = {
+  id: 'fallen',
+  name: 'Fallen God',
+  genre: 'Final boss · death & despair',
+  tagline: 'The last battle: a lone voice over tolling booms, then a choir in wrath, braams and a death-blow on every bar.',
+  palette: ['#e8d9b0', '#9e1b1b', '#0b0606'],
+  meter: '4/4',
+  tempo: [128, 144],
+  modes: [['phrygian', 1], ['harmonic', 0.9], ['aeolian', 0.6]],
+  sync: 0.05,
+  chordExt: 'triad',
+  padVoice: 'choirAh',
+  reverb: { size: 4, damp: 0.45, wet: 0.38, predelay: 0.035 },
+  tilt: { low: 2, high: 0 },
+  mix: { choir: 1.15, drums: 1.1 },
+  humanize: 0.6,
+  fx: {
+    big: [['braam', 1], ['boom', 1], ['impact', 0.9], ['gong', 0.6], ['crash', 0.5]],
+    hit: [['boom', 0.9], ['anvil', 0.4]],
+    drop: [['subDrop', 0.8], ['gong', 0.5]],
+    roll: 'timpani',
+    run: 'strings',
+  },
+  titles: {
+    a: ['Fallen', 'Hollow', 'Shattered', 'Ashen', 'Accursed', 'Forsaken', 'Last', 'Dying'],
+    b: ['God', 'Crown', 'Throne', 'Lord', 'Star', 'Order', 'Oath', 'Ruin'],
+    join: '',
+  },
+  form(len) {
+    const L = lv(len);
+    const up = L >= 1 ? 1 : 0;
+    // strings racing underneath, the battle's heartbeat
+    const race = (v: number, reg = 50) => ost('spiccato', '0000 1111 0000 1111 | 0000 1111 3333 2222', { reg, vel: v, acc: 'X.o. x.o. X.o. x.o.' });
+    // the chorus hurls chords: long, short-short, long
+    const wrath = (v: number, o: O<PadLayer> = {}) => pad('choirAh', { bus: 'choir', reg: 55, n: 4, vel: v, pat: 'X--- ---- x--- x--- | X--- ---- x.x. x...', ...o });
+    // the death-blows: a boom on every bar, a braam every two, taiko and timpani driving
+    const doom = (v: number): DrumLayer => drums({
+      boom: 'X... .... .... .... | X... .... .... ....',
+      braam: 'X... .... .... .... | .... .... .... ....',
+      taikoLo: 'X... ..x. X... ..x. | X... ..x. X.x. X...',
+      timpani: 'X... .... x... .... | X... .... x.x. x.xx',
+      anvil: '.... .... X... .... | .... .... X... ....',
+      crash: 'X... .... .... .... | .... .... .... ....',
+    }, { vel: v, fill: { taikoLo: 'X.x. X.x. XxXx XXXX', timpani: 'X.o. x.o. x.xx xxxx', boom: 'X... .... X... X...' } });
+    return [
+      sec('The Last Throne', 'intro', 4, 0.22, [
+        mel('soprano', 'statement', { vel: 0.6 }),
+        pad('choirLo', { bus: 'choir', pedal: true, reg: 43, n: 2, vel: 0.3, art: 4 }),
+        pad('organ', { pedal: true, reg: 36, n: 2, vel: 0.22, art: 4 }),
+        drums({ boom: 'X... .... .... ....', gong: '.... .... .... .... | X... .... .... ....' }, { vel: 0.8, every: 2 }),
+      ], { rate: 2, exit: ['roll'], say: 'Silence after the long road. One voice sings your notes, and far below a boom tolls like a bell for the dead.' }),
+
+      sec('Godfall', 'theme', 8, 0.85, [
+        mel('choirAh', 'theme', { vel: 0.88, bus: 'choir', dbl: [{ inst: 'lowBrass', oct: -1, vel: 0.6, bus: 'brass' }, { inst: 'strings', oct: 1, vel: 0.56 }] }),
+        wrath(0.5, { reg: 50, n: 3 }),
+        race(0.62),
+        bass('strings', '0.0. 0.0. 0.0. 0.0.', { reg: 33, vel: 0.62, acc: 'X.o. x.o. X.o. x.o.' }),
+        bass('lowBrass', '0--- ---- ---- ---- | 1--- ---- 0--- ----', { reg: 33, vel: 0.56, bus: 'brass' }),
+        doom(0.8),
+      ], { enter: 'big', say: 'It rises. The whole choir hurls your theme, the trombones an octave beneath it, and every bar lands with a death-blow.' }),
+
+      ...when(L >= 1, sec('Phase of Despair', 'theme', 8, 0.6, [
+        mel('lowBrass', 'call', { vel: 0.8, bus: 'brass' }),
+        mel('choirStac', 'response', { vel: 0.7, bus: 'choir' }),
+        ost('tremolo', '0--- ---- 1--- ---- | 0--- ---- 3--- ----', { reg: 62, vel: 0.36 }),
+        race(0.5, 48),
+        bass('cello', '0--- ---- 1--- ---- | 0--- ---- ---- ----', { reg: 33, vel: 0.5 }),
+        drums({ boom: 'X... .... .... .... | .... .... .... ....', taikoLo: 'X... ..x. .... x... | X... ..x. x.x. ....', timpani: 'X... .... .... .... | X... .... x... ....' }, { vel: 0.66 }),
+      ], { prog: 'B', say: 'The brass calls out the theme like a curse, and the chorus spits it back in short, broken syllables.' })),
+
+      sec('No Escape', 'build', 4, 0.7, [
+        mel('choirStac', 'fragment', { vel: 0.76, bus: 'choir', cresc: [0.7, 1.15], dbl: [{ inst: 'lowBrass', oct: -1, vel: 0.5, bus: 'brass' }] }),
+        ost('spiccato', '0000 0000 0000 0000', { reg: 48, vel: 0.56, cresc: [0.6, 1.2], acc: 'X.o. x.o. X.o. x.o.' }),
+        ost('tremolo', '0--- ---- ---- ---- | 1--- ---- ---- ----', { reg: 67, vel: 0.36, cresc: [0.5, 1.3] }),
+        drums({
+          boom: 'X... .... .... .... | X... .... .... .... | X... .... X... .... | X... X... X... X...',
+          timpani: 'X... x... X... x... | X... x... X.x. x.x. | X.x. x.x. X.x. x.x. | xxxx xxxx xxxx xxxx',
+        }, { vel: 0.62, cresc: [0.5, 1.15] }),
+      ], { exit: ['roll', 'run'], say: 'Your first notes again and again, a step higher each time, while the booms come faster and faster.' }),
+
+      sec('Death Blow', 'climax', 8, 1, [
+        mel('choirAh', 'theme', { oct: 1, vel: 0.95, bus: 'choir', dbl: [{ inst: 'trumpets', oct: 0, vel: 0.6, bus: 'brass' }, { inst: 'strings', oct: 1, vel: 0.7 }, { inst: 'lowBrass', oct: -1, vel: 0.62, bus: 'brass' }] }),
+        wrath(0.62),
+        counter('horns', { reg: 52, vel: 0.56, bus: 'brass' }),
+        race(0.7, 52),
+        pad('organ', { reg: 43, n: 4, vel: 0.34 }),
+        bass('strings', '0.0. 0.0. 0.0. 0.0.', { reg: 33, vel: 0.7, acc: 'X.o. x.o. X.o. x.o.' }),
+        bass('sub', '0--- ---- ---- ---- | 0--- ---- ---- ----', { reg: 28, vel: 0.5 }),
+        doom(0.92),
+      ], { enter: 'big', say: 'The full weight: sopranos an octave up, organ and brass beneath, a braam and a boom tearing open every bar.' }),
+
+      ...when(L >= 1, sec('Requiem for a God', 'break', 8, 0.22, [
+        mel('soprano', 'broad', { vel: 0.58 }),
+        pad('choirOo', { bus: 'choir', reg: 55, n: 4, vel: 0.26, art: 4 }),
+        pad('strings', { reg: 52, n: 3, vel: 0.26, art: 4 }),
+        mel('bell', 'sparse', { vel: 0.34, bus: 'color' }),
+        drums({ boom: 'X... .... .... .... | .... .... .... ....' }, { vel: 0.6, every: 2 }),
+      ], { rate: 2, exit: ['roll', 'run'], say: 'It falls. For a moment only a voice, a bell and the slow toll of the boom: a lament for what it used to be.' })),
+
+      ...when(L >= 2, sec('Second Phase', 'theme', 8, 0.8, [
+        mel('strings', 'inverted', { vel: 0.82, dbl: [{ inst: 'horns', oct: -1, vel: 0.5, bus: 'brass' }] }),
+        wrath(0.52, { reg: 52 }),
+        race(0.64),
+        bass('lowBrass', '0--- ---- 1--- ---- | 0--- ---- ---- ----', { reg: 33, vel: 0.56, bus: 'brass' }),
+        doom(0.82),
+      ], { prog: 'B', enter: 'big', say: 'It gets back up. Your theme turned upside down, faster and more desperate than before.' })),
+
+      ...when(L >= 1, sec('The Final Phase', 'finale', 8, 1, [
+        mel('choirAh', 'theme', { oct: 1, vel: 0.97, bus: 'choir', dbl: [{ inst: 'trumpets', oct: 0, vel: 0.64, bus: 'brass' }, { inst: 'strings', oct: 1, vel: 0.72 }, { inst: 'lowBrass', oct: -1, vel: 0.64, bus: 'brass' }, { inst: 'bell', oct: 0, vel: 0.36, bus: 'color' }] }),
+        wrath(0.66),
+        counter('horns', { reg: 52, vel: 0.58, bus: 'brass' }),
+        race(0.72, 52),
+        pad('organ', { reg: 43, n: 4, vel: 0.38 }),
+        bass('strings', '0.0. 0.0. 0.0. 0.0.', { reg: 33, vel: 0.72, acc: 'X.o. x.o. X.o. x.o.' }),
+        bass('sub', '0--- ---- ---- ---- | 0--- ---- ---- ----', { reg: 28, vel: 0.54 }),
+        doom(0.96),
+      ], { prog: 'final', lift: up, enter: 'big', say: 'The final phase, a semitone higher: everything at once, the bell tolling inside the choir.' })),
+
+      sec('Ashes', 'outro', 4, 0.15, [
+        pad('choirLo', { bus: 'choir', pedal: true, reg: 43, n: 3, vel: 0.4, art: 4 }),
+        pad('organ', { pedal: true, reg: 36, n: 2, vel: 0.28, art: 4 }),
+        mel('soprano', 'sparse', { vel: 0.46, to: 3 }),
+        drums({ boom: 'X... .... .... ....', gong: 'X... .... .... ....' }, { vel: 0.85, to: 1 }),
+      ], { prog: 'pedal', lift: up, say: 'One last boom, a gong, and the low choir holding a single chord over the ashes.' }),
+    ];
+  },
+};
+
+// ═════════════════════════════ AMPLIFY — your own song, made epic ═════════════════════════════
+// The music here is the imported recording itself; the layer under it is written by backing.ts,
+// not by a form. The form is only a placeholder for the pads before a song is imported.
+const amplify: StylePreset = {
+  id: 'amplify',
+  name: 'Amplify',
+  genre: 'Your song, made epic',
+  tagline: 'Plays your imported song exactly as it is and lays drums, a drone and impacts under it.',
+  palette: ['#ffd36e', '#ff7a45', '#2b1a4f'],
+  meter: '4/4',
+  tempo: [60, 180],
+  modes: [['aeolian', 1], ['ionian', 0.8]],
+  sync: 0,
+  chordExt: 'triad',
+  padVoice: 'strings',
+  reverb: { size: 3.2, damp: 0.45, wet: 0.3, predelay: 0.025 },
+  tilt: { low: 1.5, high: 0.5 },
+  humanize: 0,
+  fx: {
+    big: [['impact', 1], ['boom', 1], ['crash', 0.7], ['subDrop', 0.6]],
+    hit: [['boom', 0.85], ['crash', 0.4]],
+    drop: [['subDrop', 0.6]],
+    roll: 'timpani',
+  },
+  titles: { a: ['Amplified'], b: ['Song'], join: 'of' },
+  form() {
+    return [sec('Undercurrent', 'theme', 4, 0.3, [pad('strings', { pedal: true, reg: 43, n: 2, vel: 0.4, art: 1 })])];
+  },
+};
+
+export const STYLE_LIST: StylePreset[] = [amplify, titan, fallen, eldritch, requiem, choirs, darkcello, valor, baile, hellforge, column, carousel, ashen, cataclysm, silk, neon, pulse, phantom, breakneck, tape, aether];
 export const STYLES: Record<string, StylePreset> = Object.fromEntries(STYLE_LIST.map((s) => [s.id, s]));

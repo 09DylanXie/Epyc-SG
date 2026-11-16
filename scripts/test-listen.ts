@@ -1,6 +1,6 @@
 // Melody extraction against songs whose melody is known: a lead line over chords, bass and drums.
 //   npx tsx scripts/test-listen.ts
-import { listen } from '../src/engine/listen';
+import { listen, pickInWindow } from '../src/engine/listen';
 
 const SR = 16000;
 let failures = 0;
@@ -171,6 +171,40 @@ for (const c of cases) {
   if (c.name.includes('known limit')) continue;
   if (acc < (c.leadDb < -8 ? 0.5 : c.harmonics <= 3 || c.leadDb < -4 || c.voice ? 0.7 : 0.85)) fail(`${c.name}: only ${(acc * 100).toFixed(0)}% of notes right`);
   if (!inTune) fail(`${c.name}: best phrase is not a stretch of the melody`);
+}
+
+// asking for a stretch of the song: the phrase must come from inside it and be that part of the tune
+{
+  const { pcm, truth } = song(cases[1]);
+  const heard = listen(pcm, SR);
+  // B runs over truth notes 7..13, C over 21..27
+  const part = (a: number, b: number) => ({ from: truth[a].t, to: truth[b].t + truth[b].d, pcs: ',' + truth.slice(a, b + 1).map((x) => x.midi % 12).join(',') + ',' });
+  for (const [label, p, size] of [['the B idea', part(7, 13), undefined], ['the C variation', part(21, 27), undefined], ['a short slice of C', part(21, 27), 4]] as const) {
+    const ph = pickInWindow(heard.line, { from: p.from, to: p.to, size });
+    const pcs = ph ? ',' + ph.notes.map((m) => m % 12).join(',') + ',' : '';
+    const inside = !!ph && ph.from >= p.from - 0.35 && ph.to <= p.to + 0.35;
+    console.log(`window ${label.padEnd(20)} ${p.from.toFixed(1)}–${p.to.toFixed(1)}s → ${ph ? `${ph.notes.join(' ')} @${ph.from.toFixed(1)}–${ph.to.toFixed(1)}s${ph.loose ? ' (loose)' : ''}` : '—'}`);
+    if (!inside) fail(`window ${label}: phrase is not inside the asked stretch`);
+    else if (!p.pcs.includes(pcs)) fail(`window ${label}: phrase is not that part of the tune`);
+    if (size && ph && ph.notes.length > 6) fail(`window ${label}: asked for a short phrase, got ${ph.notes.length} notes`);
+  }
+  // asking for more notes than the strict rules allow: the fallback takes a longer run, flagged as a guess
+  const big = pickInWindow(heard.line, { from: truth[0].t, to: truth[13].t + truth[13].d, size: 11, min: 9 });
+  console.log(`window longer (≥9 notes)          → ${big ? `${big.notes.join(' ')} @${big.from.toFixed(1)}–${big.to.toFixed(1)}s${big.loose ? ' (loose)' : ''}` : '—'}`);
+  if (!big || big.notes.length < 9) fail('asking for a longer phrase did not give one');
+  const short = pickInWindow(heard.line, { from: truth[0].t, to: truth[6].t + truth[6].d, size: 4, max: 4 });
+  if (!short || short.notes.length > 4) fail(`asking for at most 4 notes gave ${short?.notes.length}`);
+  // a buried lead: the gates fail, but an explicit request still gets the clearest notes there
+  {
+    const b = song(cases[7]);
+    const bh = listen(b.pcm, SR);
+    const w = { from: b.truth[7].t, to: b.truth[13].t + b.truth[13].d };
+    const ph = pickInWindow(bh.line, w);
+    console.log(`window on the buried lead          → ${ph ? `${ph.notes.join(' ')} @${ph.from.toFixed(1)}–${ph.to.toFixed(1)}s${ph.loose ? ' (loose)' : ''}` : '—'} [known limit: notes may be wrong]`);
+    if (!ph || ph.from < w.from - 0.35 || ph.to > w.to + 0.35) fail('buried lead: an asked window gave nothing inside it');
+  }
+  const after = pickInWindow(heard.line, { from: truth[truth.length - 1].t + truth[truth.length - 1].d + 0.3, to: pcm.length / SR });
+  if (after) fail(`window after the tune ended still found ${after.notes.join(' ')}`);
 }
 
 // silence and noise must not crash or invent a confident tune

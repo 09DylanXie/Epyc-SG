@@ -1,13 +1,23 @@
 import { create } from 'zustand';
 import { player } from '@/engine/audio/player';
+import { AMPLIFY_ID, composeBacking } from '@/engine/backing';
+import type { SongMap } from '@/engine/beat';
 import { compose, inspire } from '@/engine/composer';
 import { STYLES } from '@/engine/styles';
 import type { ModeId } from '@/engine/theory';
 import { BUSES, type Bus, type Origin, type PieceLength, type Score, type StylePreset } from '@/engine/types';
-import { fitRange, type Phrase } from '@/engine/listen';
+import { fitRange, MAX_SECONDS, pickInWindow, type HeardNote, type Phrase, type Window } from '@/engine/listen';
+import { mmss, noteNames, parseRequest } from '@/engine/request';
 import { allPadMidis, inScale, type PadKey } from './keys';
 
 export const MAX_NOTES = 16;
+
+export interface ChatLine {
+  who: 'you' | 'me';
+  text: string;
+}
+
+const span = (p: { from: number; to: number }) => (mmss(p.from) === mmss(p.to) ? `at ${mmss(p.from)}` : `${mmss(p.from)}–${mmss(p.to)}`);
 const LIB_KEY = 'epyc-sg.library.v1';
 const PREF_KEY = 'epyc-sg.prefs.v1';
 
@@ -40,6 +50,16 @@ export interface ExportState {
   label: string;
   done: { name: string; bytes: number; seconds: number } | null;
   error: string | null;
+  /** exporting one part of the piece only (beats, and its name) */
+  part: ExportPart | null;
+}
+
+export interface ExportPart {
+  idx: number;
+  name: string;
+  /** beats */
+  from: number;
+  to: number;
 }
 
 type ForgeKind = 'new' | 'world' | 'restore';
@@ -56,7 +76,9 @@ interface Studio {
   /** the motif was heard in an imported recording (cleared as soon as the motif is edited) */
   origin: Origin | null;
   /** the phrases heard in the last imported recording, to try another */
-  heard: { name: string; phrases: Phrase[]; idx: number } | null;
+  heard: { name: string; phrases: Phrase[]; idx: number; line: HeardNote[]; seconds: number } | null;
+  /** talking to the composer about the imported song */
+  chat: ChatLine[];
   /** an import in progress */
   importing: { p: number; label: string } | null;
   seed: number;
@@ -106,6 +128,9 @@ interface Studio {
   setDrop(on: boolean): void;
   importFile(file: File): Promise<void>;
   nextPhrase(): void;
+  /** a request in plain words about the imported song; answers in the chat */
+  tell(text: string): void;
+  reply(text: string): void;
   setKbTarget(t: 'pads' | 'piano'): void;
   shiftOctave(d: number): void;
   forge(kind?: ForgeKind): Promise<void>;
@@ -118,8 +143,13 @@ interface Studio {
   toggleMute(bus: Bus): void;
   setCinema(on: boolean): void;
   say(msg: string): void;
-  openExport(open: boolean): void;
+  /** open the export; with a section index, for that part of the piece only */
+  openExport(open: boolean, part?: number): void;
   download(format: 'mp3' | 'wav'): Promise<void>;
+  /** where a part of the piece ends, in beats (the next part's start, or the end of the piece) */
+  partSpan(idx: number): { from: number; to: number } | null;
+  /** put the lead line of one part of the piece on the JAM pads, rhythm and all, ready to forge */
+  sectionToJam(idx: number): void;
   openPiece(p: SavedPiece): void;
   removePiece(id: string): void;
 }
@@ -150,6 +180,9 @@ function writeJson(key: string, value: unknown) {
   }
 }
 
+/** the last song imported, at full quality, for Amplify to play (kept in memory only) */
+let lastSong: { name: string; buf: AudioBuffer; map: SongMap; tune: number } | null = null;
+
 let toastTimer = 0;
 let previewRun = 0;
 let wired = false;
@@ -163,6 +196,8 @@ export const useStudio = create<Studio>()((set, get) => {
       const pads = allPadMidis(s.padKey);
       player.warm(pads.filter((m) => voiceAt(style, m) === style.padVoice), style.padVoice);
       if (style.padLow) player.warm(pads.filter((m) => m < style.padLow!.below), style.padLow.inst);
+      // Amplify's layer is written from the song; its few drums are prepared when it loads
+      if (style.id === AMPLIFY_ID) return;
       const rehearsal = `${style.id}:${s.drop}`;
       if (rehearsed === rehearsal) return;
       rehearsed = rehearsal;
@@ -177,6 +212,75 @@ export const useStudio = create<Studio>()((set, get) => {
     writeJson(PREF_KEY, { styleId: s.styleId, length: s.length, intensity: s.intensity, drop: s.drop, volume: s.volume, kbTarget: s.kbTarget });
   };
 
+  /** put a heard phrase on the pads and build a piece from it */
+  const applyPhrase = (ph: Phrase, idx: number, asked: boolean) => {
+    const h = get().heard;
+    if (!h) return;
+    // the composer finds the key from these notes; a hand-picked key would fight the recording
+    set({
+      heard: { ...h, idx },
+      motif: fitRange(ph.notes).slice(0, MAX_NOTES),
+      origin: {
+        name: h.name,
+        from: ph.from,
+        to: ph.to,
+        repeats: asked ? undefined : ph.repeats,
+        loose: ph.loose,
+        asked: asked || undefined,
+        rhythm: ph.rhythm?.slice(0, MAX_NOTES),
+        bpm: lastSong?.map.bpm ? Math.round(lastSong.map.bpm * 10) / 10 : undefined,
+      },
+      capture: true,
+      keyLocked: false,
+    });
+    void get().forge('new');
+  };
+
+  /** Amplify: the imported recording, untouched, with a layer written from its beats under it */
+  const amplify = async (kind: ForgeKind) => {
+    const s = get();
+    const style = STYLES[AMPLIFY_ID];
+    const song = lastSong;
+    if (!song) {
+      get().say('Amplify plays a song you import and makes it bigger. Import one (the Import button, or drop a file on the page).');
+      return;
+    }
+    const before = s.phase;
+    try {
+      player.ensure();
+      get().releaseAll();
+      const seed = kind === 'restore' ? s.seed : rand();
+      const t0 = performance.now();
+      const score = composeBacking({ map: song.map, name: song.name, seed, intensity: s.intensity, tune: song.tune, songSeconds: song.buf.duration });
+      const m = song.map;
+      const steps: ForgeStep[] = [
+        { label: 'Song', detail: `${song.name} · ${mmss(m.seconds)}` },
+        { label: 'Beat', detail: `${score.bpm} BPM · ${score.totalBars} bars` },
+        { label: 'Drone', detail: score.song && score.events.some((e) => e.i === 'strings') ? score.progression : 'none: drums only' },
+        { label: 'Layer', detail: score.sections.map((x) => x.name).join(' · ') },
+        { label: 'Mix', detail: 'your song untouched, the layer under it' },
+      ];
+      const forgeLine = `Your song plays as it is. Under it: ${score.events.length.toLocaleString('en-US')} hits and held notes on its own beat, ${score.progression.toLowerCase()}.`;
+      set({ phase: 'forging', steps, stepAt: 0, loadP: 0, pending: score, forgeLine, seed, playing: false });
+      player.setSong(song.buf);
+      const loading = player.load(score, style, (p) => set({ loadP: p }));
+      for (let i = 0; i < steps.length; i++) {
+        set({ stepAt: i });
+        player.pulse(i === 0 || i === steps.length - 1);
+        await sleep(kind === 'new' ? 120 : 60);
+      }
+      await loading;
+      // not saved to the library: the recording itself is only kept until the page reloads
+      set({ score, pending: null, phase: 'ready', capture: false, sectionIdx: 0, chordIdx: 0, stepAt: steps.length });
+      player.play(0);
+      forgeTiming.total = performance.now() - t0;
+    } catch (err) {
+      console.error(err);
+      set({ phase: before, pending: null });
+      get().say('The forge stumbled — ' + (err instanceof Error ? err.message : 'please try again.'));
+    }
+  };
+
   return {
     styleId: 'titan',
     motif: [],
@@ -186,6 +290,7 @@ export const useStudio = create<Studio>()((set, get) => {
     drop: false,
     origin: null,
     heard: null,
+    chat: [],
     importing: null,
     seed: 1,
     padKey: { tonicPc: 2, mode: 'aeolian' },
@@ -212,7 +317,7 @@ export const useStudio = create<Studio>()((set, get) => {
 
     cinema: false,
     toast: null,
-    exp: { open: false, busy: false, p: 0, label: '', done: null, error: null },
+    exp: { open: false, busy: false, p: 0, label: '', done: null, error: null, part: null },
     library: [],
 
     init() {
@@ -346,8 +451,12 @@ export const useStudio = create<Studio>()((set, get) => {
     },
 
     setLength(l) {
+      const s = get();
+      if (l === s.length) return;
       set({ length: l });
       savePrefs();
+      // the same melody at the new length, straight away (Amplify is as long as the song)
+      if (s.score && s.phase !== 'forging' && !s.importing && s.styleId !== AMPLIFY_ID) void get().forge('new');
     },
 
     setIntensity(v) {
@@ -382,6 +491,7 @@ export const useStudio = create<Studio>()((set, get) => {
       previewRun++;
       const style = STYLES[s.styleId];
       const before = s.phase;
+      if (style.id === AMPLIFY_ID) return amplify(kind);
       try {
         player.ensure();
         get().releaseAll();
@@ -455,15 +565,36 @@ export const useStudio = create<Studio>()((set, get) => {
       try {
         player.ensure();
         const { hearFile } = await import('@/engine/audio/hear');
-        const heard = await hearFile(file, (p, label) => set({ importing: { p, label } }));
+        const { heard, audio } = await hearFile(file, (p, label) => set({ importing: { p, label } }));
         set({ importing: null });
-        if (!heard.phrases.length) {
-          get().say(`I couldn't hear a clear melody in ${file.name}. A song with a clear lead or vocal line works best.`);
+        const name = file.name.replace(/\.[a-z0-9]+$/i, '');
+        lastSong = heard.map ? { name, buf: audio, map: heard.map, tune: heard.tune ?? 0 } : null;
+        const amp = get().styleId === AMPLIFY_ID;
+        if (amp && !lastSong) {
+          get().say(`I couldn't find a beat in ${file.name} to play along with. A song with drums or a steady pulse works best.`);
           return;
         }
-        const name = file.name.replace(/\.[a-z0-9]+$/i, '');
-        set({ heard: { name, phrases: heard.phrases, idx: -1 } });
+        if (!heard.phrases.length) {
+          if (amp) {
+            set({ heard: null, chat: [], motif: [], origin: null });
+            void get().forge('new');
+            return;
+          }
+          get().say(`I couldn't hear a clear melody in ${file.name}. A song with a clear lead or vocal line works best${lastSong ? ' — or pick Amplify to play the song itself with an epic layer under it' : ''}.`);
+          return;
+        }
+        set({ heard: { name, phrases: heard.phrases, idx: -1, line: heard.line, seconds: heard.seconds }, chat: [] });
+        // in Amplify this builds the layer under the song; the phrase is kept for switching modes later
         get().nextPhrase();
+        if (amp) {
+          get().reply(`Playing ${name} exactly as it is, with a layer of drums, a low drone and impacts under it that follows its beat. Switch to another mode (say “make it Titan”) and I’ll build a new piece from its melody instead.`);
+          return;
+        }
+        const first = heard.phrases[0];
+        const n = heard.phrases.length;
+        get().reply(
+          `I listened to ${name} (${mmss(heard.seconds)}) and found ${n} phrase${n === 1 ? '' : 's'} I could use. I started with the ${first.loose ? 'clearest guess' : 'strongest one'}, ${span(first)}. Tell me which part of the song to take the melody from instead, like “use 1:20 to 1:35” or “something near the end”.`,
+        );
         if (heard.phrases[0].loose) get().say(`The melody in ${file.name} was hard to hear clearly, so this is a best guess. A song with a clear lead or vocal line works best.`);
       } catch (err) {
         // the reason is shown to the person; nothing else to report
@@ -475,11 +606,109 @@ export const useStudio = create<Studio>()((set, get) => {
     nextPhrase() {
       const s = get();
       if (!s.heard || s.phase === 'forging') return;
-      const idx = (s.heard.idx + 1) % s.heard.phrases.length;
-      const ph = s.heard.phrases[idx];
-      // the composer finds the key from these notes; a hand-picked key would fight the recording
-      set({ heard: { ...s.heard, idx }, motif: fitRange(ph.notes), origin: { name: s.heard.name, from: ph.from, to: ph.to, repeats: ph.repeats, loose: ph.loose }, capture: true, keyLocked: false });
-      void get().forge('new');
+      const n = s.heard.phrases.length;
+      const now = s.motif.join();
+      // skip a phrase that is the one already playing (a stretch picked in the chat can match one)
+      let idx = (s.heard.idx + 1) % n;
+      for (let k = 0; k < n - 1 && fitRange(s.heard.phrases[idx].notes).slice(0, MAX_NOTES).join() === now; k++) idx = (idx + 1) % n;
+      applyPhrase(s.heard.phrases[idx], idx, false);
+    },
+
+    tell(text) {
+      const s = get();
+      const said = text.trim();
+      if (!said) return;
+      set({ chat: [...s.chat, { who: 'you' as const, text: said }].slice(-40) });
+      const reply = get().reply;
+      if (s.phase === 'forging' || s.importing) return reply('One moment, I’m still working on the last change. Ask again when it’s done.');
+      const h = s.heard;
+      if (!h) return reply('Import a song first (the Import button, or drop a file on the page), then tell me which part to take the melody from.');
+      const r = parseRequest(said, { seconds: h.seconds, styles: Object.values(STYLES).map((x) => ({ id: x.id, name: x.name })) });
+      if (s.styleId === AMPLIFY_ID && r.kind !== 'style') {
+        if (r.kind === 'again') {
+          void get().forge('new');
+          return reply('Rebuilding the layer. It follows your song’s beat and loudness, so it comes out much the same each time; turn Intensity up or down first to change how much of it there is.');
+        }
+        return reply(`In Amplify your song plays exactly as it is, so there’s no melody to pick from it. Switch to another mode (say “make it Titan”) and I’ll build a piece from part of ${h.name}; then you can tell me which part.`);
+      }
+      const cur = s.origin;
+      const take = (from: number, to: number, size?: number, why = '', more: Partial<Window> = {}) => {
+        const ph = pickInWindow(h.line, { from, to, size, ...more });
+        if (!ph) return reply(`I couldn’t hear any melody between ${mmss(from)} and ${mmss(to)}. It may be quiet or only drums there, so try another stretch.`);
+        const n = s.motif.length;
+        if (more.min && ph.notes.length <= n) return reply(`I couldn’t find a longer phrase around ${span(cur!)}; the melody breaks up there. Give me a wider stretch instead, like “use ${mmss(Math.max(0, cur!.from - 5))} to ${mmss(Math.min(h.seconds, cur!.to + 10))}”.`);
+        if (more.max && ph.notes.length >= n) return reply(`I couldn’t find a shorter phrase around ${span(cur!)}.`);
+        applyPhrase(ph, h.idx, true);
+        reply(
+          `${why}Took ${ph.notes.length} notes from ${span(ph)}: ${noteNames(ph.notes)}.${ph.loose ? ' The melody is hard to make out there, so this is a best guess.' : ''} Rebuilding the piece in ${STYLES[get().styleId].name} around them.`,
+        );
+      };
+      switch (r.kind) {
+        case 'window':
+          return take(r.from, r.to, r.size);
+        case 'past-end':
+          return reply(
+            h.seconds >= MAX_SECONDS - 1
+              ? `I only listened to the first ${mmss(h.seconds)} of ${h.name}, so I can’t reach ${mmss(r.at)}. Pick a time before that.`
+              : `${h.name} is only ${mmss(h.seconds)} long, so there’s nothing at ${mmss(r.at)}. Pick a time before that.`,
+          );
+        case 'shift': {
+          if (!cur) return reply('Tell me a time to start from first, like “use 1:20 to 1:35”.');
+          if (r.dir < 0) {
+            if (cur.from < 1.5) return reply('This phrase is already at the very start of the song.');
+            return take(Math.max(0, cur.from - 15), cur.from - 0.2, undefined, 'Going earlier. ');
+          }
+          if (cur.to > h.seconds - 1.5) return reply('This phrase is already at the very end of what I heard.');
+          return take(cur.to + 0.2, Math.min(h.seconds, cur.to + 15), undefined, 'Going later. ');
+        }
+        case 'size': {
+          if (!cur) return reply('Pick a stretch of the song first, like “use 1:20 to 1:35”.');
+          const longer = r.size > 8;
+          const n = s.motif.length;
+          if (!longer && n <= 3) return reply(`This phrase is only ${n} notes already.`);
+          if (longer && n >= MAX_NOTES) return reply(`This phrase already has the most notes a motif can hold (${MAX_NOTES}).`);
+          const pad = longer ? 4 : 0.5;
+          return take(Math.max(0, cur.from - pad), Math.min(h.seconds, cur.to + pad), r.size, longer ? 'A longer phrase from about the same spot. ' : 'A shorter phrase from the same spot. ', longer ? { min: n + 1 } : { max: n - 1 });
+        }
+        case 'next': {
+          if (h.phrases.length < 2) return reply('I only found one clear phrase on my own. Give me a time instead, like “use 1:20 to 1:35”.');
+          get().nextPhrase();
+          const i = get().heard!.idx;
+          return reply(`Trying phrase ${i + 1} of ${h.phrases.length}, ${span(h.phrases[i])}.`);
+        }
+        case 'option': {
+          if (r.n < 1 || r.n > h.phrases.length) return reply(`I have phrases 1 to ${h.phrases.length}. Say “list” to see them.`);
+          applyPhrase(h.phrases[r.n - 1], r.n - 1, false);
+          return reply(`Using phrase ${r.n}, ${span(h.phrases[r.n - 1])}.`);
+        }
+        case 'reset':
+          applyPhrase(h.phrases[0], 0, false);
+          return reply(`Back to my first pick, ${span(h.phrases[0])}.`);
+        case 'list':
+          return reply(
+            `Phrases I found in ${h.name}: ` +
+              h.phrases.map((p, i) => `${i + 1}) ${span(p)}, ${p.notes.length} notes${i === h.idx && cur && !cur.asked ? ' (playing)' : ''}`).join(' · ') +
+              '. Say “option 2” to use one, or give me any time.',
+          );
+        case 'again':
+          if (!s.motif.length) return reply('There’s no melody to rebuild yet. Give me a time to take it from.');
+          void get().forge('new');
+          return reply('Same melody, new arrangement.');
+        case 'style':
+          if (r.id === s.styleId) return reply(`It’s already in ${STYLES[r.id].name}.`);
+          get().setWorld(r.id);
+          return reply(`Rebuilding the same melody in ${STYLES[r.id].name}.`);
+        case 'sections':
+          return reply('I can’t tell verses from choruses yet. Give me a time instead, like “use 1:20 to 1:35” or “the last 30 seconds”.');
+        default:
+          return reply(
+            'I can take the melody from any part of the song. Try “use 1:20 to 1:35”, “around 2:05”, “the first 30 seconds”, “later”, “earlier”, “longer”, “shorter”, “another one”, “list”, “option 3”, “go back”, “new arrangement”, or a mode name like “make it Phantom”.',
+          );
+      }
+    },
+
+    reply(text) {
+      set({ chat: [...get().chat, { who: 'me' as const, text }].slice(-40) });
     },
 
     toggle() {
@@ -542,23 +771,77 @@ export const useStudio = create<Studio>()((set, get) => {
       toastTimer = window.setTimeout(() => set({ toast: null }), 3800);
     },
 
-    openExport(open) {
+    openExport(open, part) {
       const e = get().exp;
       if (e.busy) return;
-      set({ exp: { open, busy: false, p: 0, label: '', done: null, error: null } });
+      const sc = get().score;
+      const span = open && part !== undefined ? get().partSpan(part) : null;
+      const p: ExportPart | null = span && sc ? { idx: part!, name: sc.sections[part!].name, ...span } : null;
+      set({ exp: { open, busy: false, p: 0, label: '', done: null, error: null, part: p } });
     },
 
     async download(format) {
       const s = get();
       if (!s.score || s.exp.busy) return;
-      set({ exp: { open: true, busy: true, p: 0, label: 'Tuning the orchestra', done: null, error: null } });
+      const part = s.exp.part;
+      set({ exp: { open: true, busy: true, p: 0, label: 'Tuning the orchestra', done: null, error: null, part } });
       try {
-        const done = await player.download(format, (p, label) => set({ exp: { ...get().exp, p, label } }));
-        set({ exp: { open: true, busy: false, p: 1, label: 'Done', done, error: null } });
+        const done = await player.download(format, (p, label) => set({ exp: { ...get().exp, p, label } }), part ?? undefined);
+        set({ exp: { open: true, busy: false, p: 1, label: 'Done', done, error: null, part } });
       } catch (err) {
         console.error(err);
-        set({ exp: { open: true, busy: false, p: 0, label: '', done: null, error: err instanceof Error ? err.message : 'Export failed' } });
+        set({ exp: { open: true, busy: false, p: 0, label: '', done: null, error: err instanceof Error ? err.message : 'Export failed', part } });
       }
+    },
+
+    partSpan(idx) {
+      const sc = get().score;
+      const sec = sc?.sections[idx];
+      if (!sc || !sec) return null;
+      const end = sc.sections[idx + 1]?.startBeat ?? sc.durationSec / (60 / sc.bpm);
+      return { from: sec.startBeat, to: end };
+    },
+
+    sectionToJam(idx) {
+      const s = get();
+      const sc = s.score;
+      const sec = sc?.sections[idx];
+      if (!sc || !sec || s.phase === 'forging') return;
+      if (sc.song) return get().say('In Amplify the music is your recording — import it in another mode to take its melody.');
+      const span = get().partSpan(idx)!;
+      const spb = 60 / sc.bpm;
+      // the lead line of this part, one note per onset (the highest, if two start together)
+      const line: { t: number; d: number; m: number }[] = [];
+      for (const n of sc.melody) {
+        if (n.t < span.from - 1e-6 || n.t >= span.to - 1e-6) continue;
+        const last = line[line.length - 1];
+        if (last && Math.abs(last.t - n.t) < 1e-3) {
+          if (n.m > last.m) line[line.length - 1] = n;
+        } else line.push(n);
+      }
+      line.sort((a, b) => a.t - b.t);
+      // its opening phrase: up to a motif's worth of notes within four bars
+      const bar = sec.beats / Math.max(1, sec.bars);
+      const phrase = line.filter((n) => n.t < (line[0]?.t ?? 0) + 4 * bar).slice(0, MAX_NOTES);
+      if (phrase.length < 2) return get().say(`There’s no melody in ${sec.name} to take — try a part where the tune plays.`);
+      const t0 = phrase[0].t;
+      const r3 = (x: number) => Math.round(x * 1000) / 1000;
+      const last = phrase[phrase.length - 1];
+      previewRun++;
+      set({
+        motif: fitRange(phrase.map((n) => n.m)),
+        origin: {
+          name: `${sc.title} · ${sec.name}`,
+          from: r3(t0 * spb),
+          to: r3((last.t + last.d) * spb),
+          rhythm: phrase.map((n) => [r3((n.t - t0) * spb), r3(n.d * spb)] as [number, number]),
+          bpm: sc.bpm,
+          own: true,
+        },
+        capture: true,
+        keyLocked: false,
+      });
+      get().say(`${phrase.length} notes from ${sec.name} are on the JAM pads, rhythm and all. Pick a mode and FORGE to build a new piece from them.`);
     },
 
     openPiece(p) {

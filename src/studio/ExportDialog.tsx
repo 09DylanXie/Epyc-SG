@@ -1,5 +1,6 @@
 'use client';
 
+import { PART_TAIL } from '@/engine/audio/render';
 import { STYLES } from '@/engine/styles';
 import { Check, Close } from './icons';
 import { useStudio } from './store';
@@ -15,7 +16,9 @@ export default function ExportDialog() {
   const style = useStudio((s) => STYLES[s.styleId]);
   const { openExport, download } = useStudio.getState();
   if (!exp.open || !score) return null;
-  const secs = score.durationSec;
+  const part = exp.part;
+  const spb = 60 / score.bpm;
+  const secs = part ? (part.to - part.from) * spb + PART_TAIL : score.durationSec;
 
   return (
     <div className="scrim" onPointerDown={(e) => e.target === e.currentTarget && openExport(false)}>
@@ -29,6 +32,11 @@ export default function ExportDialog() {
             <div className="mt-1 text-[12.5px] text-dim">
               {style.name} · {score.keyName} · {score.bpm} BPM · {clock(secs)}
             </div>
+            {part && (
+              <div className="mt-2 inline-flex items-center gap-1.5 rounded-full border border-white/10 bg-white/[0.05] px-2.5 py-1 text-[11.5px] font-semibold" data-testid="dl-part">
+                Just one part: {part.name} · {clock(part.from * spb)}–{clock(part.to * spb)}
+              </div>
+            )}
           </div>
           <button className="tbtn flex-none" onClick={() => openExport(false)} disabled={exp.busy} aria-label="Close">
             <Close size={18} />
@@ -75,12 +83,16 @@ export default function ExportDialog() {
           )}
           {exp.error && <div className="rounded-2xl border border-red-400/30 bg-red-500/10 px-4 py-3 text-[12.5px] text-red-200">Export failed: {exp.error}</div>}
           {!exp.busy && !exp.done && !exp.error && (
-            <p className="text-[12px] leading-relaxed text-faint">The whole piece is performed again offline — in a few seconds, with your current mixer settings — then encoded on your device. Nothing is uploaded.</p>
+            <p className="text-[12px] leading-relaxed text-faint">{part ? 'This part' : 'The whole piece'} is performed again offline — in a few seconds, with your current mixer settings — then encoded on your device. Nothing is uploaded.</p>
           )}
         </div>
 
         <div className="mt-5 border-t border-white/[0.08] pt-4 text-[11.5px] leading-relaxed text-dim">
-          {origin ? (
+          {score.song ? (
+            <>
+              <b className="text-ink">This file contains your recording.</b> <b className="text-dim">{score.song.name}</b> plays in it exactly as you imported it, with the new layer under it. Only release it if you have the rights to that recording.{' '}
+            </>
+          ) : origin && !origin.own ? (
             <>
               <b className="text-ink">Check the melody first.</b> The tune of this piece was taken from <b className="text-dim">{origin.name}</b>. If you don&apos;t own that melody, make sure you have the rights to use it before releasing this. Everything around it was written new.{' '}
             </>
@@ -93,7 +105,7 @@ export default function ExportDialog() {
           <a className="underline decoration-white/30 underline-offset-2 hover:text-ink" href="/samples/CREDITS.txt" target="_blank" rel="noreferrer">
             VSCO 2 Community Edition
           </a>
-          , released into the public domain (CC0); everything else is synthesized in your browser. No loops, no licensed tracks.{origin ? '' : ' Use it in your games, films, streams and commercial projects.'}
+          , released into the public domain (CC0); everything else is synthesized in your browser. No loops, no licensed tracks.{origin && !origin.own ? '' : ' Use it in your games, films, streams and commercial projects.'}
         </div>
       </div>
     </div>
