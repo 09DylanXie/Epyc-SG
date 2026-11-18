@@ -100,7 +100,8 @@ async function loadSample(key: string): Promise<void> {
   try {
     if (typeof window === 'undefined') throw new Error('no audio here');
     decoder ??= new OfflineAudioContext(2, 1, BUF_SR);
-    const res = await fetch(`/samples/${set}/${root}.mp3`);
+    const basePath = process.env.NEXT_PUBLIC_BASE_PATH ?? '';
+    const res = await fetch(`${basePath}/samples/${set}/${root}.mp3`);
     if (!res.ok) throw new Error(String(res.status));
     const b = await decoder.decodeAudioData(await res.arrayBuffer());
     const d = b.getChannelData(0);
